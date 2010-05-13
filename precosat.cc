@@ -32,7 +32,9 @@ extern "C" {
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/unistd.h>
+#if !defined(__APPLE__)
 #include <malloc.h>
+#endif
 #include <unistd.h>
 };
 
