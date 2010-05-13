@@ -1,0 +1,6 @@
+These are the sources of the SAT solver PrecoSAT.
+To build issue
+
+./configure && make
+
+for compilation options see './configure -h'.
