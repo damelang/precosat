@@ -1,5 +1,5 @@
 /***************************************************************************
-Copyright (c) 2009, Armin Biere, Johannes Kepler University.
+Copyright (c) 2009 - 2010, Armin Biere, Johannes Kepler University.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to
@@ -28,22 +28,8 @@ extern "C" {
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
 };
-
-#if defined(__APPLE__)
-// from http://notmuchmail.org/pipermail/notmuch/2009/000033.html
-char* strndup(const char* str, size_t n) {
-  size_t len = strlen(str);
-  if (len <= n)
-    return strdup(str);
-  char* result = new char[n+1];
-  size_t i;
-  for (i = 0; i <= n; i++)
-    result[i] = str[i];
-  result[i] = '\0';
-  return result;
-}
-#endif
 
 using namespace PrecoSat;
 
@@ -98,6 +84,7 @@ static const char * usage =
 "\n"
 "  -h             this command line summary\n"
 "  -v             increase verbosity\n"
+"  -f             force reading DIMACS file even if header is missing\n"
 "  -q             be quiet and only set exit code\n"
 "  -n             do not print witness\n"
 "  -N             do not print witness nor result line\n"
@@ -116,6 +103,7 @@ static const char * usage =
 
 int main (int argc, char ** argv) {
   bool fclosefile=false,pclosefile=false,nowit=false,nores=false,simp=false;
+  bool force=false;
   int print=0, decision_limit=INT_MAX;
   const char * name = 0, * output = 0;
   bool satelite=false,blocked=false;
@@ -138,6 +126,7 @@ int main (int argc, char ** argv) {
     if (!strcmp (argv[i], "--verbose=0")) { verbose=0; continue; }
     if (!strcmp (argv[i], "--verbose=1")) { verbose=1; continue; }
     if (!strcmp (argv[i], "--verbose=2")) { verbose=2; continue; }
+    if (!strcmp (argv[i], "-f")) { force=true; continue; }
     if (!strcmp (argv[i], "-q")) { quiet = 1; continue; }
     if (!strcmp (argv[i], "-p")) { print = 1; continue; }
     if (!strcmp (argv[i], "-s")) { simp = true; continue; }
@@ -199,16 +188,19 @@ int main (int argc, char ** argv) {
   while ((ch = getc (file)) == 'c')
     while ((ch = getc (file)) != '\n' && ch != EOF)
       ;
+  int m = 0, n = 0, v = 0;
+  bool header = false;
   if (ch == EOF)
     goto INVALID_HEADER;
   ungetc (ch, file);
-  int m, n;
   if (fscanf (file, "p cnf %d %d\n", &m, &n) != 2) {
 INVALID_HEADER:
-    fprintf (stderr, "*** precosat: invalid header\n");
-    exit (1);
-  }
-  if (verbose) {
+    if (!force) {
+      fprintf (stderr, "*** precosat: invalid header\n");
+      exit (1);
+    }
+  } else header= true;
+  if (verbose && header) {
     printf ("c found header 'p cnf %d %d'\n", m, n);
     fflush (stdout);
   }
@@ -227,7 +219,9 @@ INVALID_HEADER:
 	  ;
 	if (*p) {
 	  assert (*p == '=');
-	  char * opt = strndup (arg, p - arg);
+	  char * opt = (char*) malloc (p - arg);
+	  (void) strncpy (opt, arg, p - arg);
+	  opt[p - arg] = 0;
 	  if (!strcmp (opt, "output")) ok = solver.set (opt, p + 1);
 	  else ok = solver.set (opt, atoi (p + 1));
 	  free (opt);
@@ -246,6 +240,7 @@ INVALID_HEADER:
   if (blocked || satelite) {
     assert (simp);
     solver.set ("decompose",0);
+    solver.set ("autark",0);
     solver.set ("probe",0);
     solver.set ("otfs",0);
     solver.set ("elimasym", 0);
@@ -256,7 +251,7 @@ INVALID_HEADER:
   int lit, sign;
   int res = 0;
 
-  ch = getc (file);
+  if (ch != EOF) ch = getc (file);
 
 NEXT:
 
@@ -277,7 +272,7 @@ NEXT:
 
   if (ch == EOF) goto DONE;
 
-  if (!n) {
+  if (header && !n && !force) {
     fprintf (stderr, "*** precosat: too many clauses\n");
     res = 1;
     goto EXIT;
@@ -294,21 +289,23 @@ NEXT:
   lit = (ch - '0');
   while (isdigit (ch = getc (file))) lit = 10 * lit + (ch - '0');
 
-  if (lit > m) {
-    fprintf (stderr, "*** precosat: variables exceeded\n");
+  if (header && lit > m) {
+    fprintf (stderr, "*** precosat: maximum variable index exceeded\n");
     res = 1;
     goto EXIT;
   }
 
+  if (lit > v) v = lit;
+
   lit = 2 * lit + sign;
   solver.add (lit);
-  if (!lit) n--;
+  if (header && !lit) n--;
 
   goto NEXT;
 
 DONE:
 
-  if (n) {
+  if (header && n && !force) {
     fprintf (stderr, "*** precosat: clauses missing\n");
     res = 1;
     goto EXIT;
@@ -341,6 +338,7 @@ DONE:
     if (!quiet && !nores) printf ("s SATISFIABLE\n");
     if (!nowit) {
       fflush (stdout);
+      if (!header) m = v;
       if (m) fputs ("v", stdout);
       for (int i = 1; i <= m; i++) {
 	if (i % 8) fputc (' ', stdout);

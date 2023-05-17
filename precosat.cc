@@ -1,5 +1,5 @@
 /***************************************************************************
-Copyright (c) 2009, Armin Biere, Johannes Kepler University.
+Copyright (c) 2009 - 2011, Armin Biere, Johannes Kepler University.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to
@@ -26,15 +26,14 @@ IN THE SOFTWARE.
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <cstddef>
+#include <climits>
 
 extern "C" {
 #include <ctype.h>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <sys/unistd.h>
-#if !defined(__APPLE__)
-#include <malloc.h>
-#endif
 #include <unistd.h>
 };
 
@@ -64,6 +63,12 @@ extern "C" {
 #define INC(s) do { stats.s++; } while (0)
 #else
 #define INC(s) do { } while (0)
+#endif
+
+#ifdef CHECKWITHPICOSAT
+extern "C" {
+#include "../picosat/picosat.h"
+};
 #endif
 
 namespace PrecoSat {
@@ -110,8 +115,126 @@ static inline double average (double a, double b) { return b ? a/b : 0; }
 
 static inline double percent (double a, double b) { return 100*average(a,b); }
 
+static unsigned gcd (unsigned a, unsigned b) {
+  unsigned tmp;
+  assert (a), assert (b);
+  if (a < b) swap (a, b);
+  while (b) tmp = b, b = a % b, a = tmp;
+  return a;
+}
+
+#if !defined(NDEBUG) || CHECKWITHPICOSAT
+int ulit2ilit (int u) { return (u/2)*((u&1)?-1:1); }
+#endif
+
 static bool parity (unsigned x)
   { bool res = false; while (x) res = !res, x &= x-1; return res; }
+
+class Progress {
+    Solver * solver;
+    int countdown, interval;
+    char type;
+  public:
+    Progress (Solver * s, char t, int c = 111) : 
+      solver (s), countdown (c), interval (c), type (t) 
+    { assert (countdown > 0); }
+    void tick () {
+      if (!solver->hasterm ()) return;
+      if (countdown--) return;
+      solver->report (2, type);
+      countdown = interval;
+    }
+};
+
+struct LitScore {
+  int lit, score;
+  LitScore (int l, int s) : lit (l), score (s) { }
+};
+
+struct FreeVarsLt {
+  LitScore a, b;
+  FreeVarsLt (LitScore c, LitScore d) : a (c), b (d) { }
+  operator bool () const {
+    if (b.score < a.score) return true;
+    if (b.score > a.score) return false;
+    return a.lit < b.lit;
+  }
+};
+
+template<class T, class L> class Sorter {
+  Mem & mem;
+  Stack<long> stack;
+  const static long limit = 10;
+  static void swap (T & a, T & b) { T tmp = a; a = b; b = tmp; }
+  static void cwap (T & a, T & b) { 
+    if (L (b, a)) swap (a, b);
+    assert (!L (b, a)); // otherwise 'L' inconsistent
+  }
+  void part (T * a, long l, long r, long & i) {
+    long j = r; i = l - 1;
+    T pivot = a[j];
+    for (;;) {
+      while (L (a[++i], pivot)) ;
+      while (L (pivot, a[--j])) if (j == l) break;
+      if (i >= j) break;
+      swap (a[i], a[j]);
+    }
+    swap (a[i], a[r]);
+  }
+  void qsort (T * a, long n) {
+    long l = 0, r = n - 1;
+    if (r - l <= limit) return;
+    long m, ll, rr, i;
+    assert (!stack);
+    for (;;) {
+      m = (l + r) / 2;
+      swap (a[m], a[r-1]);
+      cwap (a[l], a[r-1]);
+      cwap (a[l], a[r]);
+      cwap (a[r-1], a[r]);
+      part (a, l+1, r-1, i);
+      if (i - l < r - i) ll = i+1, rr = r, r = i-1;
+      else ll = l, rr = i-1, l = i+1;
+      if (r - l > limit) {
+	assert (rr - ll > limit);
+	stack.push (mem, ll);
+	stack.push (mem, rr);
+      } else if (rr - ll > limit) l = ll, r = rr;
+      else if (stack) r = stack.pop (), l = stack.pop ();
+      else break;
+    }
+  }
+  void isort (T * a, long n) {
+    for (long i = n-1; i > 0; i--) cwap (a[i-1], a[i]);
+#ifndef NDEBUG
+    for (long i = 1; i < n; i++) assert (!L (a[i], a[0]));
+#endif
+    for (long i = 2; i < n; i++) {
+      long j = i;
+      T pivot = a[i];
+      while (L (pivot, a[j-1])) 
+	a[j] = a[j-1], j--, assert (j > 0);
+      a[j] = pivot;
+    }
+  }
+  void check (T * a, long n) {
+#ifndef NDEBUG
+    for (long i = 0; i < n-1; i++) assert (!L (a[i+1], a[i]));
+#else
+    (void) a, (void) n;
+#endif
+  }
+public:
+  Sorter (Mem & m) : mem (m) { }
+  ~Sorter () { stack.release (mem); }
+  void sort (T * a, long n) { 
+    if (!n) return;
+    qsort (a, n);
+    isort (a, n);
+    check (a, n); 
+  }
+};
+
 }
 
 using namespace PrecoSat;
@@ -124,7 +247,23 @@ inline unsigned RNG::next () {
 }
 
 inline bool RNG::oneoutof (unsigned spread) {
-  return spread ? !(next () % spread) : true;
+  unsigned tmp = next (), mask = 0xffffffffu, shift = 16, res;
+  if (!spread) return true;
+  for (;;) {
+    mask >>= shift;
+    if (mask < spread) break;
+    tmp ^= tmp >> shift;
+    tmp &= mask;
+    shift /= 2;
+  }
+  res = tmp % spread;
+  return res == spread/2;
+}
+
+inline bool RNG::choose () {
+  unsigned tmp = next ();
+  bool res = 1 & ((tmp >> 13) ^ (tmp >> 9) ^ (tmp >> 5));
+  return res;
 }
 
 inline size_t Cls::bytes (int n) {
@@ -219,11 +358,11 @@ inline void Solver::disconnect (Cls * c) {
   Anchor<Cls> & a = anchor (c);
   if (connected (a, c)) dequeue (a, c);
   if (c->binary) {
-    occs[l0].bins.remove(l1);
-    occs[l1].bins.remove(l0);
+    occs[l0].bins.trymove(l1);
+    occs[l1].bins.trymove(l0);
   } else {
-    occs[l0].large.remove(Occ(0,c));
-    occs[l1].large.remove(Occ(0,c));
+    occs[l0].large.trymove(Occ(0,c));
+    occs[l1].large.trymove(Occ(0,c));
   }
   if (fwds) fwds[c->minlit ()].remove (c);
   if (!orgs || c->lnd) return;
@@ -231,7 +370,6 @@ inline void Solver::disconnect (Cls * c) {
     orgs[*p].remove (c);
 }
 
-inline Rnk * Solver::prb (const Rnk * r) { return prbs + (r - rnks); }
 inline Rnk * Solver::rnk (const Var * v) { return rnks + (v - vars); }
 inline Var * Solver::var (const Rnk * r) { return vars + (r - rnks); }
 
@@ -290,8 +428,13 @@ void Solver::touchelim (int lit) {
   assert (orgs);
   int pos = orgs[lit];
   int neg = orgs[1^lit];
+#if 0
   long long tmp = -(((long long)pos) * (long long) neg);
+  tmp += pos + neg;
   int nh =  (tmp >= INT_MIN) ? (int) tmp : INT_MIN;
+#else
+  int nh = -(pos + neg);
+#endif
   int oh = r->heat; r->heat = nh;
   if (oh == nh && schedule.elim.contains (r)) return;
   if (oh == nh) LOG ("touchelim " << lit << " again " << nh);
@@ -385,11 +528,13 @@ inline void Solver::recycle (int lit) {
   assert (!level);
 #ifndef NDEBUG
   Var * v = vars + (lit/2); Vrt t = v->type;
-  assert (t == FIXED || t == PURE || t == ZOMBIE || t == ELIM);
+  assert (t == FIXED || t == PURE || t == ZOMBIE || t == ELIM || t == AUTARK);
 #endif
-  if (!orgs) return;
-  while (int size = orgs[lit]) recycle (orgs[lit][size - 1]);
-  orgs[lit].release (mem);
+  if (orgs) {
+    Stack<Cls*> & s = orgs[lit];
+    while (s) recycle (s.top ());
+    s.release (mem);
+  }
   occs[lit].bins.release (mem);
   occs[lit].large.release (mem);
 }
@@ -465,17 +610,20 @@ void Solver::clrbwsigs () {
 }
 
 void Solver::delbwsigs () {
+  assert (bwsigs);
   size_t bytes = 2 * size * sizeof *bwsigs;
   mem.deallocate (bwsigs, bytes);
   bwsigs = 0;
 }
 
 void Solver::initorgs () {
+  assert (!orgs);
   size_t bytes = 2 * (maxvar + 1) * sizeof *orgs;
   orgs = (Orgs*) mem.callocate (bytes);
 }
 
 void Solver::delorgs () {
+  assert (orgs);
   for (int lit = 2; lit <= 2*maxvar+1; lit++) orgs[lit].release (mem);
   size_t bytes = 2 * (maxvar + 1) * sizeof *orgs;
   mem.deallocate (orgs, bytes);
@@ -488,6 +636,7 @@ void Solver::initfwds () {
 }
 
 void Solver::delfwds () {
+  assert (fwds);
   for (int lit = 2; lit <= 2*maxvar+1; lit++) fwds[lit].release (mem);
   size_t bytes = 2 * (maxvar + 1) * sizeof *fwds;
   mem.deallocate (fwds, bytes);
@@ -501,6 +650,7 @@ void Solver::initfwsigs () {
 }
 
 void Solver::delfwsigs () {
+  assert (fwsigs);
   size_t bytes = 2 * (maxvar + 1) * sizeof *fwsigs;
   mem.deallocate (fwsigs, bytes);
   fwsigs = 0;
@@ -519,16 +669,21 @@ void Solver::delprfx () {
 #define OPT(n,v,mi,ma) \
 do { opts.add (mem, # n, v, &opts.n, mi, ma); } while (0)
 
-void Solver::initerm (void) {
-  terminal = (out == stdout) && isatty(1);
+bool Solver::hasterm (void) {
+  if (!terminitialized) initerm ();
+  return terminal;
 }
 
-void Solver::init (int initialmaxvar)
-{
+void Solver::initerm (void) {
+  if (opts.terminal < 2) terminal = opts.terminal;
+  else terminal = (out == stdout) && isatty(1);
+  terminitialized = true;
+}
+
+void Solver::init (int initialmaxvar) {
   maxvar = initialmaxvar;
   size = 1;
-  while (maxvar >= size)
-    size *= 2;
+  while (maxvar >= size) size *= 2;
   queue = 0;
   queue2 = 0;
   level = 0;
@@ -538,35 +693,36 @@ void Solver::init (int initialmaxvar)
   typecount = 1;
   lastype = 0;
   out = stdout;
-  initerm ();
+  terminitialized = false;
   measure = true;
   iterating = false;
+  simpmode = false;
   elimode = false;
   blkmode = false;
   puremode = false;
   asymode = false;
+  autarkmode = false;
   extending = false;
   assert (!initialized);
 
-  vars = (Var*) mem.callocate (size * sizeof *vars);
-  for (int i = 1; i <= maxvar; i++)
-    vars[i].dlevel = -1;
-
   iirfs = 0;
 
-  repr = (int*) mem.callocate (2 * size * sizeof *repr);
-  jwhs = (int*) mem.callocate (2 * size * sizeof *jwhs);
-  vals = (Val*) mem.callocate (2 * size * sizeof *vals);
-  occs = (Occs*) mem.callocate (2 * size * sizeof *occs);
-  rnks = (Rnk*) mem.allocate (size * sizeof *rnks);
-  prbs = (Rnk*) mem.allocate (size * sizeof *prbs);
-  elms = (Rnk*) mem.allocate (size * sizeof *elms);
   blks = (Rnk*) mem.allocate (2 * size * sizeof *blks);
+  jwhs = (int*) mem.callocate (2 * size * sizeof *jwhs);
+  occs = (Occs*) mem.callocate (2 * size * sizeof *occs);
+  repr = (int*) mem.callocate (2 * size * sizeof *repr);
+  vals = (Val*) mem.callocate (2 * size * sizeof *vals);
+
+  elms = (Rnk*) mem.allocate (size * sizeof *elms);
+  rnks = (Rnk*) mem.allocate (size * sizeof *rnks);
+  vars = (Var*) mem.callocate (size * sizeof *vars);
+
+  for (int i = 1; i <= maxvar; i++)
+    vars[i].dlevel = -1;
 
   for (Rnk * p = rnks + maxvar; p > rnks; p--)
     p->heat = 0, p->pos = -1, schedule.decide.push (mem, p);
 
-  for (Rnk * p = prbs + maxvar; p > prbs; p--) p->heat = 0, p->pos = -1;
   for (Rnk * p = elms + maxvar; p > elms; p--) p->heat = 0, p->pos = -1;
   for (Rnk * p = blks + 2*maxvar+1; p > blks+1; p--) p->heat = 0, p->pos = -1;
 
@@ -587,30 +743,35 @@ void Solver::init (int initialmaxvar)
   OPT (rtc,0,0,2);
   OPT (quiet,0,0,1);
   OPT (verbose,0,0,2);
+  OPT (terminal,2,0,2);
   OPT (print,0,0,1);
   OPT (check,0,0,2);
-  OPT (order,3,1,9);
+  OPT (order,2,1,9);
   OPT (simprd,20,0,M); OPT (simpinc,26,0,100); OPT (simprtc,0,0,2);
+  OPT (cutrail,1,0,1);
   OPT (merge,1,0,1);
   OPT (dominate,1,0,1);
   OPT (maxdoms,5*1000*1000,0,M);
   OPT (otfs,1,0,1);
   OPT (block,1,0,1); 
-    OPT (blockrtc,0,0,2); OPT (blockimpl,1,0,1);
+    OPT (blockrtc,1,0,2); OPT (blockimpl,1,0,1);
     OPT (blockprd,10,1,M); OPT (blockint,300*1000,0,M);
     OPT (blockotfs,1,0,1);
     OPT (blockreward,100,0,10000);
     OPT (blockboost,3,0,100);
   OPT (heatinc,10,0,100);
   OPT (luby,1,0,1);
-  OPT (restart,1,0,1); OPT (restartint,100,1,M); 
+  OPT (restart,1,0,1); OPT (restartint,10,1,M); 
   OPT (restartinner,10,0,1000); OPT (restartouter,10,0,1000);
-  OPT (rebias,1,0,1); OPT (rebiasint,1000,1,M);
-  OPT (probe,1,0,1); 
-    OPT (probeint,100*1000,1000,M); OPT (probeprd,10,1,M);
-    OPT (probertc,0,0,2); OPT (probereward,2000,0,10000);
-    OPT (probeboost,5,0,10000);
+  OPT (restartminlevel,10,0,1000);
+  OPT (rebias,1,0,1); OPT (rebiasint,1000,1,M); OPT (rebiasorgonly,0,0,1);
+  OPT (probe,1,0,1);
+    OPT (probeint,200*1000,1000,M); OPT (probeprd,5,1,M);
+    OPT (probertc,0,0,2); OPT (probereward,100,0,10000);
+    OPT (probeboost,6,0,10000);
   OPT (decompose,1,0,1);
+  OPT (autark,0,0,1); OPT (autarkdhs,16,0,63);
+  OPT (phase,2,0,3);
   OPT (inverse,0,0,1); OPT (inveager,0,0,1); 
   OPT (mtfall,0,0,1); OPT (mtfrev,1,0,1);
   OPT (bumpuip,1,0,1); 
@@ -618,9 +779,9 @@ void Solver::init (int initialmaxvar)
     OPT (bumpturbo,0,0,1); OPT (bumpbulk,0,0,1);
   OPT (fresh,50,0,100);
   OPT (glue,Cls::MAXGLUE,0,Cls::MAXGLUE);
-    OPT (slim,1,0,1); OPT (sticky,1,0,Cls::MAXGLUE);
-  OPT (redsub,2,0,M);
-  OPT (minimize,4,0,4); OPT (maxdepth,1000,2,10000); OPT (strength,100,0,M);
+    OPT (slim,1,0,1); OPT (sticky,2,0,Cls::MAXGLUE);
+  OPT (redsub,0,0,M);
+  OPT (minimize,3,0,4); OPT (maxdepth,1000,2,10000); OPT (strength,32,0,M);
   OPT (elim,1,0,1); 
     OPT (elimgain,0,m/2,M/2);
     OPT (elimint,300*1000,0,M); OPT (elimprd,20,1,M);
@@ -629,20 +790,21 @@ void Solver::init (int initialmaxvar)
     OPT (elimclim,20,0,M);
     OPT (elimboost,1,0,100);
     OPT (elimreward,100,0,10000);
-    OPT (elimasym,2,1,100);
+    OPT (elimasym,3,1,100);
     OPT (elimasymint,100000,100,M);
     OPT (elimasymreward,1000,0,M);
-  OPT (fwmaxlen,100,0,M);OPT (bwmaxlen,1000,0,M); OPT (reslim,20,0,M);
-  OPT (blkmaxlen,1000,0,M);
+  OPT (dynbw,0,0,1); OPT (fw,1,0,1);
+  OPT (fwmaxlen,100,0,M); OPT (bwmaxlen,1000,0,M); OPT (reslim,20,0,M);
+  OPT (blkmaxlen,1000,0,M); 
   OPT (subst,1,0,1); OPT (ands,1,0,1); OPT (xors,1,0,1); OPT (ites,1,0,1);
   OPT (minlimit,500,10,10000); OPT (maxlimit,3*1000*1000,100,M);
-  OPT (dynred,4,-1,100000);
-  OPT (liminitmode,1,0,1);
-  OPT (limincmode,0,0,1);
-  OPT (liminitconst,2000,0,1000*1000);
+  OPT (dynred,-1,-1,100000);
+  OPT (liminitmode,0,0,1);
+  OPT (limincmode,2,0,2);
+  OPT (liminitconst,5000,0,1000*1000);
   OPT (liminitmax,20000,0,10*1000*1000);
   OPT (liminitpercent,10,0,1000);
-  OPT (liminconst1,2000,0,100*1000);
+  OPT (liminconst1,1000,0,100*1000);
   OPT (liminconst2,1000,0,100*1000);
   OPT (limincpercent,10,0,1000);
   OPT (enlinc,20,0,1000);
@@ -653,6 +815,11 @@ void Solver::init (int initialmaxvar)
 
   initprfx ("c ");
   initialized = true;
+#ifdef CHECKWITHPICOSAT
+  memset (&picosatcheck, 0, sizeof picosatcheck);
+  picosat_init ();
+  picosatcheck.init++;
+#endif
 }
 
 void Solver::initiirfs () {
@@ -690,20 +857,21 @@ void Solver::delclauses (Anchor<Cls> & anchor) {
 void Solver::reset () {
   assert (initialized);
   initialized = false;
-#ifndef NDEBUG
   delprfx ();
   size_t bytes;
   for (int lit = 2; lit <= 2 * maxvar + 1; lit++) occs[lit].bins.release (mem);
   for (int lit = 2; lit <= 2 * maxvar + 1; lit++) occs[lit].large.release (mem);
-  bytes = 2 * size * sizeof *occs; mem.deallocate (occs, bytes);
-  bytes = 2 * size * sizeof *vals; mem.deallocate (vals, bytes);
-  bytes = 2 * size * sizeof *repr; mem.deallocate (repr, bytes);
-  bytes = 2 * size * sizeof *jwhs; mem.deallocate (jwhs, bytes);
+
   bytes = 2 * size * sizeof *blks; mem.deallocate (blks, bytes);
-  bytes = size * sizeof *vars; mem.deallocate (vars, bytes);
-  bytes = size * sizeof *prbs; mem.deallocate (prbs, bytes);
-  bytes = size * sizeof *rnks; mem.deallocate (rnks, bytes);
+  bytes = 2 * size * sizeof *jwhs; mem.deallocate (jwhs, bytes);
+  bytes = 2 * size * sizeof *occs; mem.deallocate (occs, bytes);
+  bytes = 2 * size * sizeof *repr; mem.deallocate (repr, bytes);
+  bytes = 2 * size * sizeof *vals; mem.deallocate (vals, bytes);
+
   bytes = size * sizeof *elms; mem.deallocate (elms, bytes);
+  bytes = size * sizeof *rnks; mem.deallocate (rnks, bytes);
+  bytes = size * sizeof *vars; mem.deallocate (vars, bytes);
+
   delclauses (original);
   delclauses (binary);
   for (int glue = 0; glue <= opts.glue; glue++)
@@ -717,7 +885,6 @@ void Solver::reset () {
   schedule.block.release (mem);
   schedule.elim.release (mem);
   schedule.decide.release (mem);
-  schedule.probe.release (mem);
   opts.opts.release (mem);
   trail.release (mem);
   frames.release (mem);
@@ -728,6 +895,8 @@ void Solver::reset () {
   saved.release (mem);
   elits.release (mem);
   plits.release (mem);
+  flits.release (mem);
+  fclss.release (mem);
 #ifdef PRECOCHECK
   check.release (mem);
 #endif
@@ -735,6 +904,9 @@ void Solver::reset () {
   lits.release (mem);
   seen.release (mem);
   assert (!mem);
+  memset (this, 0, sizeof *this);
+#ifdef CHECKWITHPICOSAT
+  picosat_reset ();
 #endif
 }
 
@@ -745,6 +917,7 @@ void Solver::fxopts () {
   if (!opts.plain) return;
   opts.merge = 0;
   opts.block = 0;
+  opts.autark = 0;
   opts.dominate = 0;
   opts.rebias = 0;
   opts.probe = 0;
@@ -752,6 +925,8 @@ void Solver::fxopts () {
   opts.minimize = 2;
   opts.elim = 0;
   opts.random = 0;
+  opts.otfs = 0;
+  opts.dynred = -1;
 }
 
 void Solver::propts () {
@@ -771,14 +946,86 @@ void Solver::prstats () {
   fprintf (out, "%s%d simplifications, %d reductions\n", prfx,
            stats.simps, stats.reductions);
   fprintf (out, "%s\n", prfx);
-  fprintf (out, "%svars: %d fixed, %d equiv, %d elim, %d pure, %d zombies\n", 
+  fprintf (out, "%sarty: %.2f ands %.2f xors average arity\n", prfx,
+           average (stats.subst.ands.len, stats.subst.ands.count),
+           average (stats.subst.xors.len, stats.subst.xors.count));
+  fprintf (out, "%sautk: %d autarkies of %.1f avg size\n",
+           prfx, 
+	   stats.autarks.count, 
+	   average (stats.autarks.size, stats.autarks.count));
+  fprintf (out, "%sautk: dhs %d %d %d %d %d %d\n",
            prfx,
-           stats.vars.fixed, stats.vars.equiv,
-	   stats.vars.elim, stats.vars.pure, stats.vars.zombies);
+	   stats.autarks.dh[0],
+	   stats.autarks.dh[1],
+	   stats.autarks.dh[2],
+	   stats.autarks.dh[3],
+	   stats.autarks.dh[4],
+	   stats.autarks.dh[5]);
+  fprintf (out,
+           "%sback: %d track with %.1f avg cuts, %d jumps of %.1f avg len\n",
+	   prfx,
+	   stats.back.track, average (stats.back.cuts, stats.back.track),
+	   stats.back.jump, average (stats.back.dist, stats.back.jump));
+  fprintf (out, 
+           "%sblkd: %lld resolutions, %d phases, %d rounds\n",
+	   prfx,
+	   stats.blkd.res,
+	   stats.blkd.phases, stats.blkd.rounds);
+  assert (stats.blkd.all == stats.blkd.impl + stats.blkd.expl);
+  fprintf (out, 
+           "%sblkd: %d = %d implicit + %d explicit\n",
+	   prfx,
+	   stats.blkd.impl + stats.blkd.expl,
+	   stats.blkd.impl, stats.blkd.expl);
+  fprintf (out, "%sclss: %d recycled, %d pure, %d autark\n", prfx,
+           stats.clauses.gc, stats.clauses.gcpure, stats.clauses.gcautark);
+  assert (stats.doms.count >= stats.doms.level1);
+  assert (stats.doms.level1 >= stats.doms.probing);
+  fprintf (out, "%sdoms: %d dominators, %d high, %d low\n", prfx,
+           stats.doms.count,
+	   stats.doms.count - stats.doms.level1,
+	   stats.doms.level1 - stats.doms.probing);
   fprintf (out, "%selim: %lld resolutions, %d phases, %d rounds\n", prfx,
            stats.elim.resolutions, stats.elim.phases, stats.elim.rounds);
   fprintf (out, "%sextd: %d forced, %d assumed, %d flipped\n", prfx,
            stats.extend.forced, stats.extend.assumed, stats.extend.flipped);
+  fprintf (out, "%sglue: %.2f original glue, %.3f slimmed on average\n",
+	   prfx, 
+	   average (stats.glue.orig.sum, stats.glue.orig.count),
+	   average (stats.glue.slimmed.sum, stats.glue.slimmed.count));
+  long long alllits = stats.lits.added + stats.mins.deleted;
+  fprintf (out,
+           "%smins: %lld lrnd, %.0f%% del, %lld strng, %lld inv, %d dpth\n",
+	   prfx,
+           stats.lits.added,
+	   percent (stats.mins.deleted, alllits),
+	   stats.mins.strong, stats.mins.inverse, stats.mins.depth);
+  fprintf (out, "%sotfs: dynamic %d = %d bin + %d trn + %d large\n",
+	   prfx,
+	   stats.otfs.dyn.bin + stats.otfs.dyn.trn + stats.otfs.dyn.large,
+	   stats.otfs.dyn.bin, stats.otfs.dyn.trn, stats.otfs.dyn.large);
+  fprintf (out, "%sotfs: static %d = %d bin + %d trn + %d large\n",
+	   prfx,
+	   stats.otfs.stat.bin + stats.otfs.stat.trn + stats.otfs.stat.large,
+	   stats.otfs.stat.bin, stats.otfs.stat.trn, stats.otfs.stat.large);
+  fprintf (out, "%sprbe: %d probed, %d phases, %d rounds\n", prfx,
+	   stats.probe.variables, stats.probe.phases, stats.probe.rounds);
+  fprintf (out, "%sprbe: %d failed, %d lifted, %d merged\n", prfx,
+           stats.probe.failed, stats.probe.lifted, stats.probe.merged);
+  assert (stats.vars.pure == 
+          stats.pure.elim + stats.pure.blkd + 
+	  stats.pure.expl + stats.pure.autark);
+  fprintf (out, "%sprps: %lld srch props, %.2f megaprops per second\n",
+           prfx, stats.props.srch, 
+	  (stats.srchtime>0) ? stats.props.srch/1e6/stats.srchtime : 0);
+  fprintf (out, "%spure: %d = %d explicit + %d elim + %d blkd + %d autark\n", 
+           prfx, 
+	   stats.vars.pure,
+	   stats.pure.expl, stats.pure.elim, 
+	   stats.pure.blkd, stats.pure.autark);
+  assert (stats.vars.zombies ==
+ 	  stats.zombies.elim + stats.zombies.blkd + 
+	  stats.zombies.expl + stats.zombies.autark);
   fprintf (out, "%ssbst: %.0f%% subst, "
            "%.1f%% nots, %.1f%% ands, %.1f%% xors, %.1f%% ites\n", prfx,
            percent (stats.vars.subst,stats.vars.elim),
@@ -786,13 +1033,6 @@ void Solver::prstats () {
 	   percent (stats.subst.ands.count,stats.vars.subst),
 	   percent (stats.subst.xors.count,stats.vars.subst),
 	   percent (stats.subst.ites.count,stats.vars.subst));
-  fprintf (out, "%sarty: %.2f ands %.2f xors average arity\n", prfx,
-           average (stats.subst.ands.len, stats.subst.ands.count),
-           average (stats.subst.xors.len, stats.subst.xors.count));
-  fprintf (out, "%sprbe: %d probed, %d phases, %d rounds\n", prfx,
-	   stats.probe.variables, stats.probe.phases, stats.probe.rounds);
-  fprintf (out, "%sprbe: %d failed, %d lifted, %d merged\n", prfx,
-           stats.probe.failed, stats.probe.lifted, stats.probe.merged);
   fprintf (out, "%ssccs: %d non trivial, %d fixed, %d merged\n", prfx,
            stats.sccs.nontriv, stats.sccs.fixed, stats.sccs.merged);
 #ifndef NSTATSPRECO
@@ -827,76 +1067,17 @@ void Solver::prstats () {
 	     prfx,
 	     srch, percent (hits,srch), percent (l1h,l1s), percent(l2h,l2s));
 #endif
-  long long alllits = stats.lits.added + stats.mins.deleted;
-  fprintf (out,
-           "%smins: %lld lrnd, %.0f%% del, %lld strng, %lld inv, %d dpth\n",
+  fprintf (out, 
+           "%sstrs: %d forward, %d backward, %d dynamic, %d org, %d asym\n",
 	   prfx,
-           stats.lits.added,
-	   percent (stats.mins.deleted, alllits),
-	   stats.mins.strong, stats.mins.inverse, stats.mins.depth);
+	   stats.str.fw, stats.str.bw, stats.str.dyn,
+	   stats.str.org, stats.str.asym);
   fprintf (out,
            "%ssubs: %d fw, %d bw, %d dynamic, %d org, %d doms, %d gc\n",
 	   prfx,
 	   stats.subs.fw, stats.subs.bw,
 	   stats.subs.dyn, stats.subs.org, 
 	   stats.subs.doms, stats.subs.red);
-  fprintf (out, 
-           "%sblkd: %lld resolutions, %d phases, %d rounds\n",
-	   prfx,
-	   stats.blkd.resolutions,
-	   stats.blkd.phases, stats.blkd.rounds);
-  fprintf (out, 
-           "%sblkd: %d = %d implicit + %d explicit\n",
-	   prfx,
-	   stats.blkd.impl + stats.blkd.expl,
-	   stats.blkd.impl, stats.blkd.expl);
-  assert (stats.vars.pure == 
-          stats.pure.elim + stats.pure.blkd + stats.pure.expl);
-  fprintf (out, "%spure: %d = %d explicit + %d elim + %d blkd\n", 
-           prfx, 
-	   stats.vars.pure,
-	   stats.pure.expl, stats.pure.elim, stats.pure.blkd);
-  assert (stats.vars.zombies ==
- 	  stats.zombies.elim + stats.zombies.blkd + stats.zombies.expl);
-  fprintf (out, "%szmbs: %d = %d explicit + %d elim + %d blkd\n", 
-           prfx,
-	   stats.vars.zombies,
-	   stats.zombies.expl, stats.zombies.elim, stats.zombies.blkd);
-  fprintf (out, 
-           "%sstrs: %d forward, %d backward, %d dynamic, %d org, %d asym\n",
-	   prfx,
-	   stats.str.fw, stats.str.bw, stats.str.dyn,
-	   stats.str.org, stats.str.asym);
-  fprintf (out, "%sotfs: dynamic %d = %d bin + %d trn + %d large\n",
-	   prfx,
-	   stats.otfs.dyn.bin + stats.otfs.dyn.trn + stats.otfs.dyn.large,
-	   stats.otfs.dyn.bin, stats.otfs.dyn.trn, stats.otfs.dyn.large);
-  fprintf (out, "%sotfs: static %d = %d bin + %d trn + %d large\n",
-	   prfx,
-	   stats.otfs.stat.bin + stats.otfs.stat.trn + stats.otfs.stat.large,
-	   stats.otfs.stat.bin, stats.otfs.stat.trn, stats.otfs.stat.large);
-  fprintf (out, 
-           "%sglue: %.2f avg, %lld slimmed = %.2f per conflict\n",
-	    prfx, 
-	    average (stats.glue.sum, stats.glue.count),
-	    stats.glue.slimmed, 
-	    average (stats.glue.slimmed, stats.conflicts));
-  assert (stats.doms.count >= stats.doms.level1);
-  assert (stats.doms.level1 >= stats.doms.probing);
-  fprintf (out, "%sdoms: %d dominators, %d high, %d low\n", prfx,
-           stats.doms.count,
-	   stats.doms.count - stats.doms.level1,
-	   stats.doms.level1 - stats.doms.probing);
-  long long props = stats.props.srch + stats.props.simp;
-  fprintf (out, "%svsts: %lld visits, %.2f per prop, %.0f%% blkd",
-           prfx,
-           stats.visits, average (stats.visits, props),
-	   percent (stats.blocked, stats.visits));
-#ifndef NSTATSPRECO
-  fprintf (out, ", %.0f%% trn", 
-	   percent (stats.ternaryvisits, stats.visits));
-#endif
-  fputc ('\n', out);
   double othrtime = overalltime - stats.simptime - stats.srchtime;
   fprintf (out, "%stime: "
            "%.1f = "
@@ -908,14 +1089,32 @@ void Solver::prstats () {
            stats.srchtime, percent (stats.srchtime, overalltime),
 	   stats.simptime, percent (stats.simptime, overalltime),
 	   othrtime, percent (othrtime, overalltime));
-  fprintf (out, "%sprps: %lld srch props, %.2f megaprops per second\n",
-           prfx, stats.props.srch, 
-	  (stats.srchtime>0) ? stats.props.srch/1e6/stats.srchtime : 0);
-  fprintf (out, "%sclss: %d recycled\n", prfx,
-           stats.clauses.gc);
+  fprintf (out, "%svars: %d fxd, %d eq, %d elim, %d pure, %d zmbs, %d autk\n", 
+           prfx,
+           stats.vars.fixed, stats.vars.equiv,
+	   stats.vars.elim, stats.vars.pure, stats.vars.zombies,
+	   stats.vars.autark);
+#ifndef NSTATSPRECO
+  long long props = stats.props.srch + stats.props.simp;
+  fprintf (out,
+           "%svsts: %lld visits, %.2f per prop, %.0f%% blkd, %.0f%% trn\n", 
+           prfx,
+           stats.visits, average (stats.visits, props),
+	   percent (stats.blocked, stats.visits),
+	   percent (stats.ternaryvisits, stats.visits));
+#endif
+  fprintf (out, "%szmbs: %d = %d explicit + %d elim + %d blkd + %d autark\n", 
+           prfx,
+	   stats.vars.zombies,
+	   stats.zombies.expl, stats.zombies.elim,
+	   stats.zombies.blkd, stats.zombies.autark);
   fprintf (out, "%s\n", prfx);
   fprintf (out, "%s%.1f seconds, %.0f MB max, %.0f MB recycled\n", prfx,
            overalltime, mb (mem.getMax ()), mb (stats.collected));
+#ifdef CHECKWITHPICOSAT
+  fprintf (out, "%s\n%spicosat: %d calls, %d init\n", prfx, prfx,
+           picosatcheck.calls, picosatcheck.init);
+#endif
   fflush (out);
 }
 
@@ -936,7 +1135,7 @@ inline void Solver::assign (int lit) {
       if (v.type == FREE) {
 	stats.vars.fixed++;
 	v.type = FIXED;
-      } else assert (v.type == ZOMBIE || v.type == PURE);
+      } else assert (v.type==ZOMBIE || v.type==PURE || v.type==AUTARK);
     }
     simplified = true;
   }
@@ -991,7 +1190,8 @@ inline void Solver::imply (int lit, int reason) {
 
 inline int Solver::dominator (int lit, Cls * reason, bool & contained) {
   if (!opts.dominate) return 0;
-  if (asymode) return 0;
+  if (asymode) return 0; // TODO why is this needed?
+  if (autarkmode) return 0; // TODO why is this needed?
   if (opts.maxdoms <= stats.doms.count) return 0;
   contained = false;
   assert (level > 0);
@@ -1125,7 +1325,7 @@ inline unsigned Solver::gluelits () {
   assert (uip);
   for (const int * p = lits.begin (); p < eol; p++) {
     lit = *p;
-    assert (val (lit) < 0);
+    assert (vals[lit] < 0);
     Var * v = vars + (lit/2);
     int dlevel = v->dlevel;
     if (dlevel == level) { assert (!found); found = lit; continue; }
@@ -1138,6 +1338,7 @@ inline unsigned Solver::gluelits () {
   assert (found == uip);
   for (const int * p = lits.begin (); p < eol; p++)
     frames[vars[*p/2].dlevel].contained = false;
+  LOG ("calculated glue " << res);
   return res;
 }
 
@@ -1176,7 +1377,7 @@ inline void Solver::slim (Cls * cls) {
   }
   if (cls->glued) {
     assert (oldglue >= newglue);
-    if (oldglue == newglue) return;
+    if (oldglue == newglue) { stats.glue.slimmed.count++; return; }
     assert (newglue >= 1);
     LOG ("slimmed glue from " << oldglue << " to " << newglue);
   } else LOG ("new glue " << newglue);
@@ -1184,10 +1385,10 @@ inline void Solver::slim (Cls * cls) {
   if (!cls->fresh) dequeue (anchor (cls), cls);
   cls->glue = newglue;
   if (!cls->fresh) push (anchor (cls), cls);
-  if (cls->glued) stats.glue.slimmed++;
-  stats.glue.count++;
-  stats.glue.sum += newglue;
-  cls->glued = true;
+  if (cls->glued) {
+    stats.glue.slimmed.count++;
+    stats.glue.slimmed.sum += newglue;
+  } else cls->glued = true;
 }
 
 inline void Solver::force (int lit, Cls * reason) {
@@ -1206,7 +1407,7 @@ inline void Solver::force (int lit, Cls * reason) {
   if (!level) {
     v->binary = false, v->reason.cls = 0;
   } else if (!lits && (vdom = dominator (lit, reason, sub)) > 0)  {
-    v->dominator = vdom;
+    v->dominator = vars[vdom/2].dominator;
     assert (vals[vdom] > 0);
     vdom ^= 1;
     LOG ("dominating learned clause " << vdom << ' ' << lit);
@@ -1225,8 +1426,8 @@ inline void Solver::force (int lit, Cls * reason) {
   assign (lit);
 }
 
-inline void Solver::jwh (Cls * cls) {
-  //if (cls->lnd) return; // TODO better not ?
+inline void Solver::jwh (Cls * cls, bool orgonly) {
+  if (orgonly && cls->lnd) return;
   int * p;
   for (p = cls->lits; *p; p++)
     ;
@@ -1312,9 +1513,12 @@ Cls * Solver::clause (bool lnd, unsigned glue) {
     if (lits == 2) res->binary = true, stats.clauses.bin++;
     else {
       res->glue = min ((unsigned)opts.glue,glue);
-      res->fresh = res->lnd;
-      if (lnd) stats.clauses.lnd++;
-      else stats.clauses.orig++;
+      if (lnd) {
+	stats.glue.orig.count++;//TODO redundant?
+	stats.glue.orig.sum += glue;
+	res->fresh = true;
+        stats.clauses.lnd++;
+      } else stats.clauses.orig++;
     }
     connect (res);
   }
@@ -1575,6 +1779,7 @@ inline int Solver::fwstr (unsigned sig, Cls * c) {
 }
 
 bool Solver::fworgs () {
+  if (!opts.fw) return false;
   if (lits <= 1) return false;
   limit.budget.fw.str += 3;
   limit.budget.fw.sub += 5;
@@ -1640,28 +1845,38 @@ void Solver::resize (int newmaxvar) {
   if (newsize > size) {
     size_t o, n;
 
-    o = size * sizeof * vars;
-    n = newsize * sizeof * vars;
-    vars = (Var *) mem.recallocate (vars, o, n);
+    ptrdiff_t diff;
+    char * c;
 
-    o = 2 * size * sizeof *repr;
-    n = 2 * newsize * sizeof *repr;
-    repr = (int*) mem.recallocate (repr, o, n); 
+    o = 2 * size * sizeof *blks;
+    n = 2 * newsize * sizeof *blks;
+    c = (char*) blks;
+    blks = (Rnk*) mem.recallocate (blks, o, n);
+    diff = c - (char*) blks;
+    schedule.block.fix (diff);
 
     o = 2 * size * sizeof *jwhs;
     n = 2 * newsize * sizeof *jwhs;
     jwhs = (int*) mem.recallocate (jwhs, o, n); 
 
-    o = 2 * size * sizeof *vals;
-    n = 2 * newsize * sizeof *vals;
-    vals = (Val*) mem.recallocate (vals, o, n); 
-
     o = 2 * size * sizeof *occs;
     n = 2 * newsize * sizeof *occs;
     occs = (Occs*) mem.recallocate (occs, o, n); 
 
-    ptrdiff_t diff;
-    char * c;
+    o = 2 * size * sizeof *repr;
+    n = 2 * newsize * sizeof *repr;
+    repr = (int*) mem.recallocate (repr, o, n); 
+
+    o = 2 * size * sizeof *vals;
+    n = 2 * newsize * sizeof *vals;
+    vals = (Val*) mem.recallocate (vals, o, n); 
+
+    o = size * sizeof *elms;
+    n = newsize * sizeof *elms;
+    c = (char *) elms;
+    elms = (Rnk*) mem.reallocate (elms, o, n); 
+    diff = c - (char *) elms;
+    schedule.elim.fix (diff);
 
     o = size * sizeof *rnks;
     n = newsize * sizeof *rnks;
@@ -1670,19 +1885,9 @@ void Solver::resize (int newmaxvar) {
     diff = c - (char *) rnks;
     schedule.decide.fix (diff);
 
-    o = size * sizeof *prbs;
-    n = newsize * sizeof *prbs;
-    c = (char *) prbs;
-    prbs = (Rnk*) mem.reallocate (prbs, o, n); 
-    diff = c - (char *) prbs;
-    schedule.probe.fix (diff);
-
-    o = size * sizeof *elms;
-    n = newsize * sizeof *elms;
-    c = (char *) elms;
-    elms = (Rnk*) mem.reallocate (elms, o, n); 
-    diff = c - (char *) elms;
-    schedule.elim.fix (diff);
+    o = size * sizeof * vars;
+    n = newsize * sizeof * vars;
+    vars = (Var *) mem.recallocate (vars, o, n);
 
     rszbwsigs (newsize);
     rsziirfs (newsize);
@@ -1699,9 +1904,6 @@ void Solver::resize (int newmaxvar) {
     Rnk * r = rnks + maxvar;
     r->heat = 0, r->pos = -1, schedule.decide.push (mem, r);
 
-    Rnk * p = prbs + maxvar;
-    p->heat = 0, p->pos = -1;
-
     Rnk * e = elms + maxvar;
     e->heat = 0, e->pos = -1;
   }
@@ -1712,6 +1914,12 @@ void Solver::import () {
   bool trivial = false;
   int * q = lits.begin ();
   const int * p, * eol = lits.end ();
+  stats.clauses.oadd++;
+#ifdef CHECKWITHPICOSAT
+  for (p = lits.begin (); !trivial && p < eol; p++)
+    picosat_add (ulit2ilit (*p));
+  picosat_add (0);
+#endif
   for (p = lits.begin (); !trivial && p < eol; p++) {
     int lit = *p, v = lit/2;
     assert (1 <= v);
@@ -1792,6 +2000,7 @@ inline void Solver::prop2 (int lit) {
     LOG ("conflict in binary clause while propagating " << (1^lit));
     conflict = lit2conflict (dummy, lit, other);
     LOG ("conflicting clause " << lit << ' ' << other);
+    if (!autarkmode) break;
   }
 }
 
@@ -1805,11 +2014,14 @@ CONTINUE_OUTER_LOOP:
     int blit = p->blit;
     Cls * cls = p++->cls;
     *q++ = Occ (blit, cls);
-    stats.visits++;
+    INC (visits);
     Val val = vals[blit];
-    if (val > 0) { stats.blocked++; continue; }
+    if (val > 0) { INC (blocked); continue; }
 #ifndef NSTATSPRECO
     if (cls->lits[2] && !*(cls->lits + 3)) INC (ternaryvisits);
+#endif
+#if 1
+    if (p < t && vals[p->blit] <= 0) __builtin_prefetch (p->cls->lits);
 #endif
     int sum = cls->lits[0]^cls->lits[1];
     int other = sum^lit;
@@ -1833,6 +2045,7 @@ CONTINUE_OUTER_LOOP:
 #ifndef NLOGPRECO
       dbgprint ("LOG conflicting clause ", cls);
 #endif
+      if (autarkmode) continue;
       break;
     }
     force (other, cls);
@@ -1844,50 +2057,51 @@ CONTINUE_OUTER_LOOP:
 }
 
 bool Solver::bcp () {
-  if (conflict) return false;
+  if (conflict && !autarkmode) return false;
+  int fixed = queue2, old = stats.clauses.orig;
   if (!level && units) flushunits ();
-  if (conflict) return false;
+  if (conflict && !autarkmode) return false;
   int lit, props = 0;
   for (;;) {
     if (queue2 < trail) {
       props++;
       lit = 1^trail[queue2++];
       prop2 (lit);
-      if (!measure && conflict) break;
-    } else if (queue < trail) {
-      if (conflict) break;
+      if (conflict && /*!measure &&*/ !autarkmode) break;
+    } /*else*/ if (queue < trail) {
+      if (conflict && !autarkmode) break;
       lit = 1^trail[queue++];
       propl (lit);
-      if (conflict) break;
+      if (conflict && !autarkmode) break;
     } else
       break;
   }
   if (measure) stats.props.srch += props;
   else stats.props.simp += props;
-  return !conflict;
+  if (conflict) return false;
+  if (level) return true;
+  while (fixed < trail) {
+    int lit = trail[fixed++];
+    recycle (lit);
+  }
+  if (!simpmode) shrink (old);
+  assert (!conflict);
+  return true;
 }
 
 inline bool Solver::needtoflush () const {
   return queue2 < trail;
 }
 
-bool Solver::flush () {
-  assert (!level);
-  int fixed = queue2;
-  if (!bcp ()) return false;
-  while (fixed < trail) {
-    int lit = trail[fixed++];
-    recycle (lit);
-  }
-  assert (!conflict);
-  return true;
-}
-
 inline int Solver::phase (Var * v) {
-  int lit = 2 * (v - vars) + 1;
-  if (v->phase > 0 ||
-      (!v->phase && (jwhs[lit^1] > jwhs[lit]))) lit ^= 1;
-  return lit;
+  int lit = 2 * (v - vars), notlit = lit + 1, res;
+  if (v->phase > 0) res = lit;
+  else if (v->phase < 0) res = notlit;
+  else if (opts.phase == 0) res = notlit;
+  else if (opts.phase == 1) res = lit;
+  else if (opts.phase == 2) res = (jwhs[notlit] < jwhs[lit]) ? lit : notlit;
+  else res = rng.choose () ? lit : notlit;
+  return res;
 }
 
 void Solver::extend () {
@@ -1962,19 +2176,19 @@ bool Solver::decide () {
   assert (r);
   stats.decisions++;
   stats.sumheight += level;
-  if (opts.random && agility <= 10 * 100000 && rng.oneoutof (opts.spread)) {
+  if (opts.random && 
+      //agility <= 10 * 100000 && 
+      rng.oneoutof (opts.spread)) {
     stats.random++;
-    unsigned n = schedule.decide; assert (n);
+    unsigned n = (unsigned) maxvar; assert (n);
     unsigned s = rng.next () % n, d = rng.next () % n;
     while (ggt (n, d) != 1) {
       d++; if (d >= n) d = 1;
     }
-    for (;;) {
-      r = schedule.decide[s];
-      int lit = 2 * (r - rnks);
-      if (vars[lit/2].type == FREE && !vals[lit]) break;
+    while (vars[s+1].type != FREE || val (2*s+2)) {
       s += d; if (s >= n) s -= n;
     }
+    r = rnks + s + 1;
   }
   int lit = phase (var (r));
   assert (!vals[lit]);
@@ -2106,16 +2320,17 @@ bool Solver::inverse (int lit) {
     Cls * c = o->cls;
     int other = 0;
     for (const int * p = c->lits; (other = *p); p++) {
-      if (other == lit) { foundlit = true; continue; }
-      if (other == uip) { founduip = true; continue; }
+      if (other == lit) foundlit = true;
+      if (other == uip) founduip = true;
+      if (other == lit || other == uip) continue;
       if (vals[other] >= 0) break;
       Var * u = vars + (other/2);
       if (u->dlevel >= jlevel) break;
       if (!u->mark) break;
     }
     if (other) continue;
-    assert (founduip);
     assert (foundlit);
+    assert (founduip);
 #ifndef NLOGPRECO
     dbgprint ("LOG inverse arc ", c);
 #endif
@@ -2125,38 +2340,69 @@ bool Solver::inverse (int lit) {
   return false;
 }
 
+void Solver::unassign (int lit, bool save) {
+  assert (vals[lit] > 0);
+  vals[lit] = vals[lit^1] = 0;
+  int idx = lit/2;
+  Var & v = vars[idx];
+  LOG("unassign " << lit << 
+      " dlevel " << v.dlevel << " tlevel " << v.tlevel);
+  assert (v.dlevel > 0);
+  if (save) { LOG ("saving " << lit); saved.push (mem, lit); }
+  if (!repr[lit]) {
+    Rnk & r = rnks[lit/2];
+    if (!schedule.decide.contains (&r)) 
+      schedule.decide.push (mem, &r);
+  }
+  v.dlevel = -1;
+  if (v.binary) return;
+  Cls * c = v.reason.cls;
+  if (!c) return;
+  c->locked = false;
+  if (!c->lnd) return;
+  assert (stats.clauses.lckd > 0);
+  stats.clauses.lckd--;
+}
+
 void Solver::undo (int newlevel, bool save) {
+  if (newlevel == level) return;
   LOG ("undo " << newlevel);
   assert (newlevel <= level);
-  if (newlevel == level) return;
   if (save) saved.shrink ();
   int tlevel = frames[newlevel+1].tlevel;
+  int cnt = 0;
   while (tlevel < trail) {
     int lit = trail.pop ();
-    assert (vals[lit] > 0);
-    vals[lit] = vals[lit^1] = 0;
-    LOG("unassign " << lit);
-    if (!repr[lit]) {
-      if (save) saved.push (mem, lit);
-      Rnk & r = rnks[lit/2];
-      if (!schedule.decide.contains (&r)) schedule.decide.push (mem, &r);
-    }
-    int idx = lit/2;
-    Var & v = vars[idx];
-    v.dlevel = -1;
-    if (v.binary) continue;
-    Cls * c = v.reason.cls;
-    if (!c) continue;
-    c->locked = false;
-    if (!c->lnd) continue;
-    assert (stats.clauses.lckd > 0);
-    stats.clauses.lckd--;
+    if (!vals [lit]) continue;
+    unassign (lit, save);
+    cnt++;
   }
   frames.shrink (newlevel + 1);
   level = newlevel;
   queue = queue2 = trail;
   conflict = 0;
-  LOG ("backtrack new level " << newlevel);
+  LOG ("backtracked to new level " << newlevel << 
+       " after unassigning " << cnt << " literals");
+}
+
+void Solver::cutrail (int newtlevel) {
+  LOG ("cutting back trail from " << trail << " to " << newtlevel);
+  assert (newtlevel >= 0);
+  assert (newtlevel + 1 <= trail);
+  assert (!autarkmode);
+  queue = queue2 = newtlevel;
+  int cnt = 0;
+  while (newtlevel + 1 < trail) {
+    int lit = trail.top ();
+    if (!vars[lit/2].dlevel) break;
+    (void) trail.pop ();
+    assert (vals[lit]);
+    unassign (lit, false);
+    cnt++;
+  }
+  assert (!conflict);
+  LOG ("reststarting bcp with " << trail[newtlevel] << " at " << newtlevel);
+  stats.back.cuts += cnt;
 }
 
 inline int & Solver::iirf (Var * v, int t) {
@@ -2204,6 +2450,7 @@ inline void Solver::bump (Var * v, int add) {
 }
 
 inline void Solver::pull (int lit) {
+  assert (vals [lit] < 0);
   Var * v = vars + (lit/2);
   assert (v->dlevel && !v->mark);
   LOG ("pulling " << lit << " open " << open);
@@ -2256,7 +2503,7 @@ void Solver::bump (Cls * c) {
 #ifndef NLOGPRECO
   int lit;
   for (const int * p = c->lits; (lit = *p); p++)
-    if (val (lit) > 0) break;
+    if (vals[lit] > 0) break;
   if (lit) {
     char buffer[100];
     sprintf (buffer, "LOG bump %d forcing clause ", lit);
@@ -2265,18 +2512,18 @@ void Solver::bump (Cls * c) {
 #endif
 }
 
-static int revcmptlevel (const void * p, const void * q) {
-  Var * u = *(Var**) p, * v = *(Var**) q;
-  return v->tlevel - u->tlevel;
-}
+struct RevLtTLevel {
+  Var * u, * v;
+  RevLtTLevel (Var * a, Var * b) : u (a), v (b) { }
+  operator bool () const { return v->tlevel < u->tlevel; }
+};
 
 void Solver::bump () {
   assert (conflict);
   Var ** start, ** end, ** bos = seen.begin (), ** eos = seen.end ();
-  if (opts.bumpsort) qsort (bos, seen, sizeof *bos, revcmptlevel);
+  if (opts.bumpsort) { Sorter<Var*,RevLtTLevel> s (mem); s.sort (bos, seen); }
 #ifndef NDEBUG
-  for (Var ** p = bos; p < eos; p++)
-    if (p+1 < eos) assert (p[0]->tlevel > p[1]->tlevel);
+  for (Var ** p = bos; p + 1 < eos; p++) assert (p[0]->tlevel > p[1]->tlevel);
 #endif
   Var * uipvar = vars + (uip/2), * except = opts.bumpuip ? 0 : uipvar;
   int dir;
@@ -2310,6 +2557,7 @@ void Solver::bump () {
 }
 
 bool Solver::analyze () {
+  int orglevel = level;
 RESTART:
   assert (conflict);
   stats.conflicts++;
@@ -2447,6 +2695,14 @@ RESTART:
     } else *q++ = lit;
   }
   lits.shrink (q);
+#ifndef NDEBUG
+  {
+    const int * p;
+    for (p = lits.begin (); p < lits.end (); p++)
+      if (*p == uip) break;
+    assert (p != lits.end ());
+  }
+#endif
   jump ();
   int cjlevel = 0;
   eolits = lits.end ();
@@ -2504,44 +2760,60 @@ RESTART:
   if (unit) assert (!jlevel);
 #endif
 #ifndef NLOGPRECO
-  if (jlevel + 1 < level) LOG ("backjump to " << jlevel);
-  else LOG ("backtrack to " << jlevel);
+  if (jlevel + 1 < level) LOG ("backjumping to level " << jlevel);
+  else LOG ("backtracking to level " << jlevel);
 #endif
   undo (jlevel);
   if (!jlevel) iterating = true;
 
+#ifndef NLOGPRECO
+  {
+    int tlevel = -1;
+    for (int * p = lits.begin (); p != lits.end (); p++) {
+      int lit = *p;
+      Val val = vals[lit];
+      assert (val <= 0);
+      if (!val) { assert (lit == uip); continue; }
+      int tmp = vars[lit/2].tlevel;
+      assert (tmp >= 0);
+      if (tlevel < tmp) tlevel = tmp;
+    }
+    if (tlevel >= 0) 
+      LOG ("trail can be cut by for minimized FUIP reason " << trail - tlevel);
+  }
+#endif
+
   assert (!conflict);
   bool lnd = true;
-  bwoccs (lnd);
-  int strlevel = jlevel;
+  if (opts.dynbw) bwoccs (lnd);
   bool skip = false;
   if (strnd) {
     LOG ("analyzing " << strnd << " strengthened clauses");
     for (Cls ** p = strnd.begin (); p < strnd.end (); p++) {
       Cls * c = *p;
-      int countnonfalse = 0, maxlevel = 0;
+      int countnonfalse = 0, maxlevel = -1, maxtlevel = -1;
       for (int * q = c->lits; (lit = *q); q++) {
 	int val = vals[lit];
 	if (val > 0) break;
 	if (!val && ++countnonfalse >= 2) break;
-      }
-      if (lit || countnonfalse >= 2) continue;
-      for (int * q = c->lits; (lit = *q); q++) {
+	if (!val) continue;
 	int tmp = vars[lit/2].dlevel;
 	if (tmp > maxlevel) maxlevel = tmp;
+	tmp = vars[lit/2].tlevel;
+	if (tmp > maxtlevel) maxtlevel = tmp;
       }
-      int newstrlevel = 0;
-      for (int * q = c->lits; (lit = *q); q++) {
-	int tmp = vars[lit/2].dlevel;
-	if (tmp == maxlevel) continue;
-	assert (tmp < maxlevel);
-	if (tmp > newstrlevel) newstrlevel = tmp;
+      if (lit || countnonfalse >= 2) continue;
+      assert (maxlevel >= 0);
+      assert (maxtlevel >= 0);
+      assert (!lit && countnonfalse <= 1);
+      if (maxlevel < level) {
+	LOG ("strengthening decision level " << maxlevel);
+	undo (maxlevel);
       }
-      if (newstrlevel < strlevel) strlevel = newstrlevel;
-    }
-    if (strlevel < jlevel) {
-      LOG ("strengthened backtrack level " << strlevel);
-      undo (strlevel);
+      if (maxtlevel < trail) {
+	LOG ("strengthened trail level " << maxtlevel);
+	cutrail (maxtlevel);
+      }
     }
     marklits ();
     unsigned sig = litsig ();
@@ -2561,16 +2833,20 @@ RESTART:
 	unit = lit;
       }
       if (lit) continue;
-      assert (unit);
       assert (!c->garbage);
-      if (c->binary) {
-	int other = c->lits[0] + c->lits[1];
-	other -= unit;
-	imply (unit, other);
-      } else force (unit, c);
-      if (skip) continue;
-      skip = true;
-      LOG ("learned clause skipped because of forcing strengthened clause");
+      if (unit) {
+	if (c->binary) {
+	  int other = c->lits[0] + c->lits[1];
+	  other -= unit;
+	  imply (unit, other);
+	} else force (unit, c);
+	if (skip) continue;
+	skip = true;
+	LOG ("learned clause skipped because of forcing strengthened clause");
+      } else {
+	skip = true;
+	LOG ("learned clause skipped because of empty strengthened clause");
+      }
     }
     for (Cls ** p = strnd.begin (); p < strnd.end (); p++)
       assert ((*p)->str),  (*p)->str = false;
@@ -2580,7 +2856,7 @@ RESTART:
     for (Frame * f = frames.begin (); f < frames.end (); f++)
       assert (!f->contained);
     Cls * cls = clause (lnd, lnd ? glue : 0); //TODO: move before if?
-    if (!vals[uip] && strlevel == jlevel) {
+    if (!vals[uip] && level == jlevel) {
       if (cls) {
 	if (cls->binary) {
 	  int other = cls->lits[0] + cls->lits[1];
@@ -2618,10 +2894,33 @@ RESTART:
     }
   } else lits.shrink ();
 
+  if (opts.cutrail && level == jlevel && level > 0 && vals[uip]) {
+    Var * v = vars + (uip/2);
+    int maxtlevel = -1, lit;
+    if (v->binary) {
+      lit = v->reason.lit;
+      maxtlevel = vars[lit/2].tlevel;
+    } else {
+      Cls * c = v->reason.cls;
+      for (int * p = c->lits; (lit = *p); p++) {
+	int tmp = vars[lit/2].tlevel;
+	if (tmp > maxtlevel) maxtlevel = tmp;
+      }
+    }
+    assert (maxtlevel >= 0);
+    LOG ("cutting back UIP reason to " << maxtlevel);
+    cutrail (maxtlevel);
+  }
+
   long long tmp = hinc;
   tmp *= 100 + opts.heatinc; tmp /= 100;
   assert (tmp <= INT_MAX);
   hinc = tmp;
+
+  stats.back.track++;
+  int dist = orglevel - level;
+  assert (dist >= 1);
+  if (dist > 1) stats.back.jump++, stats.back.dist += dist;
 
   return true;
 }
@@ -2646,10 +2945,10 @@ void Solver::increp () {
   fprintf (out,
 "%s  .\n"
 "%s  ."
-"        clauses           fixed    eliminated       learned     agility"
+"       variables          fixed    eliminated       learned     agility"
 "\n"
 "%s  ."
-" seconds       variables      equivalent     conflicts      height      MB"
+" seconds         clauses      equivalent     conflicts      height      MB"
 "\n"
 "%s  .\n", prfx, prfx, prfx, prfx);
 }
@@ -2661,6 +2960,7 @@ int Solver::remvars () const {
   res -= stats.vars.elim;
   res -= stats.vars.pure;
   res -= stats.vars.zombies;
+  res -= stats.vars.autark;
   assert (res >= 0);
   return res;
 }
@@ -2669,7 +2969,7 @@ void Solver::report (int v, char type) {
   if (opts.quiet || v > opts.verbose) return;
   char countch[2];
   countch[0] = countch[1] = ' ';
-  if (terminal && type == lastype)  {
+  if (type == lastype && hasterm ())  {
     typecount++;
     if (type != 'e' && type != 'p' && type != 'k') {
       countch[0] = '0' + (typecount % 10);
@@ -2677,27 +2977,25 @@ void Solver::report (int v, char type) {
     }
   } else {
     typecount = 1;
-    if (terminal && lastype) fputc ('\n', out);
+    if (lastype && hasterm ()) fputc ('\n', out);
     increp ();
   }
   assert (maxvar >= stats.vars.fixed + stats.vars.equiv + stats.vars.elim);
   fprintf (out, "%s%c%c%c%7.1f %7d %7d %6d %6d %6d %7d %6d %6.1f %2.0f %4.0f",
           prfx,
 	  countch[1], countch[0], type, stats.seconds (),
-	  stats.clauses.irr,
 	  remvars (),
-	  stats.vars.fixed, stats.vars.equiv,
-	  stats.vars.elim,
+	  stats.clauses.irr,
+	  stats.vars.fixed, stats.vars.equiv, stats.vars.elim,
 	   type=='e'?schedule.elim:
-	  (type=='p'?schedule.probe:
-	  (type=='k'?schedule.block:stats.conflicts)),
+	  (type=='k'?schedule.block:stats.conflicts),
 	  (type=='F'?limit.reduce.fresh:
 	    (type=='l' || type=='+' || type == '-') ?
 	    limit.reduce.learned : stats.clauses.lnd),
 	  stats.height (),
 	  agility / 100000.0,
 	  mem / (double) (1<<20));
-  if (!terminal || type=='0' || type=='1' || type=='?') fputc ('\n', out);
+  if (!hasterm () || type=='0' || type=='1' || type=='?') fputc ('\n', out);
   else fputc ('\r', out);
   fflush (out);
   lastype = type;
@@ -2737,7 +3035,7 @@ void Solver::rebias () {
   if (!opts.rebias) return;
   stats.rebias.count++;
   for (Var * v = vars + 1; v <= vars + maxvar; v++) v->phase = 0;
-  jwh ();
+  jwh (opts.rebiasorgonly);
   if (stats.rebias.maxdelta >= delta) report (2, 'b');
   else stats.rebias.maxdelta = delta, report (1, 'B');
 }
@@ -2870,12 +3168,13 @@ inline int Solver::redundant (Cls * c) {
 void Solver::checkvarstats () {
 #ifndef NDEBUG
   assert (!level);
-  int fixed = 0, equivalent = 0, eliminated = 0, pure = 0, zombies = 0;
+  int fixed=0, equivalent=0, eliminated=0, pure=0, zombies=0, autarks=0;
   for (Var * v = vars + 1; v <= vars + maxvar; v++) {
     int lit = 2 * (v - vars);
     if (v->type == ELIM) eliminated++;
     else if (v->type == PURE) pure++;
     else if (v->type == ZOMBIE) zombies++;
+    else if (v->type == AUTARK) autarks++;
     else if (vals[lit]) { assert (v->type == FIXED); fixed++; }
     else if (repr[lit]) { assert (v->type == EQUIV); equivalent++; }
     else assert (v->type == FREE);
@@ -2884,7 +3183,165 @@ void Solver::checkvarstats () {
   assert (eliminated == stats.vars.elim);
   assert (pure == stats.vars.pure);
   assert (zombies == stats.vars.zombies);
+  assert (autarks == stats.vars.autark);
   assert (equivalent == stats.vars.equiv);
+#endif
+}
+
+void Solver::freecls (Cls * c) {
+  assert (c && !c->lnd);
+  if (c->freed) return;
+  int lit;
+  for (const int * p = c->lits; (lit = *p); p++)
+    if (vals[lit] > 0) break;
+  if (lit) return;
+  for (const int * p = c->lits; (lit = *p); p++) {
+    Val tmp = vals[lit];
+    assert (tmp <= 0);
+    if (tmp == 0) continue;
+    if (!vars[lit/2].dlevel) continue;
+    lit ^= 1;
+    LOG ("freeing " << lit);
+    unassign (lit);
+    flits.push (mem, lit);
+  }
+  fclss.push (mem, c);
+  c->freed = true;
+#ifndef NLOGPRECO
+  dbgprint ("LOG freed clause ", c);
+#endif
+}
+
+void Solver::autark () {
+  if (!opts.autark) return;
+  assert (!autarkmode);
+  assert (!flits);
+  assert (!fclss);
+  autarkmode = true;
+  measure = false;
+  report (2, 'a');
+  checkclean ();
+  disconnect ();
+  initorgs ();
+  connect (binary, true);
+  connect (original, true);
+  int og = stats.clauses.gc, op = stats.clauses.gcpure;
+  for (int dhi = stats.conflicts ? 5 : 4; dhi >= 0; dhi--) {
+    int dhm = (1 << dhi);
+    if (!(dhm & opts.autarkdhs)) continue;
+    LOG ("autark strategy " << dhm);
+    if (dhm == 16) jwh (true);
+    bcp ();
+    {
+      Stack<LitScore> freevars;
+      for (int idx = 1; idx <= maxvar; idx++) {
+	Var * v = vars + idx;
+	if (vars[idx].type == FREE)  {
+	  assert (!vals[2*idx]);
+	  int score = INT_MAX, lit = 2*idx;
+	  switch (dhm & opts.autarkdhs)
+	    {
+	      case 1: score = idx; break;
+	      case 2: score = -idx; break;
+	      case 4: lit ^= 1; score = idx; break;
+	      case 8: lit ^= 1; score = -idx; break;
+	      case 16: 
+		{
+		  int pjwh = jwhs[lit], njwh = jwhs[lit+1];
+		  if (njwh >= pjwh) lit++;
+		  score = max (pjwh, njwh);
+		}
+		break;
+	      case 32: lit = phase (v); score = rnks[idx].heat; break;
+	      default: continue;
+	    }
+	  freevars.push (mem, LitScore (lit, score));
+	}
+      }
+      {
+	Sorter<LitScore,FreeVarsLt> sorter (mem);
+	sorter.sort (freevars.begin (), freevars);
+      }
+      for (LitScore * p = freevars.begin (); p < freevars.end (); p++) {
+	int lit = p->lit;
+	if (vals[lit]) continue;
+#ifndef NLOGPRECO
+	int score = p->score;
+	LOG ("autark decide " << lit << " with score " << score);
+#endif
+	assume (lit);
+	bcp ();
+      }
+      freevars.release (mem);
+    }
+    for (int i = 0; i <= 1; i++)
+      for (Cls * c = i ? original.head : binary.head; c; c = c->prev)
+	if (!c->lnd) freecls (c);
+    LOG ("autark pruning starts with " << fclss << " conflicts");
+    while (flits) {
+      int lit = flits.pop ();
+      assert (!vals [lit]);
+      for (int i = 0; i < orgs[lit]; i++)
+	freecls (orgs[lit][i]);
+    }
+#ifndef NLOGPRECO
+    int ot = trail;
+#endif
+    undo (0, true);
+    LOG ("autarky prunning freed " << (ot - trail) - saved <<
+	 " literals in " << fclss << " clauses");
+#if 0 // this made gcc 4.2.4 with -O3 not terminate (???)
+    while (fclss) {
+      Cls * c = fclss.pop ();
+      assert (c->freed);
+      c->freed = false;
+    }
+#else
+    for (int i = 0; i < fclss; i++) {
+      Cls * c = fclss[i];
+      assert (c->freed);
+      c->freed = false;
+    }
+    fclss.shrink ();
+#endif
+    int size = 0, nontrivial = 0;
+    for (const int * p = saved.begin (); p < saved.end (); p++) {
+      int lit = *p;
+      assert (!repr[lit]);
+      if (!vals[lit]) {
+	size++;
+	if (orgs[lit^1]) autark (lit), nontrivial++;
+	else if (orgs[lit]) pure (lit);
+	else zombie (vars + (lit/2));
+      } else assert (vals[lit] > 0);
+    }
+    if (size) {
+      LOG ("autarky of size " << size);
+      LOG ("autarky with " << nontrivial << " non trivial assignments");
+      LOG ("autarky with " << (size - nontrivial) << " trivial assignments");
+      assert ((unsigned)dhi < sizeof(stats.autarks.dh)/sizeof(int));
+      if (nontrivial) {
+	stats.autarks.count++;
+	stats.autarks.size += size;
+	stats.autarks.dh[dhi]++;
+      }
+    }
+#ifndef NDEBUG
+    for (const int * p = saved.begin (); p < saved.end (); p++) 
+      assert (vals[*p]);
+#endif
+    saved.shrink ();
+  }
+  cleans ();
+  delorgs ();
+  gc ();
+  measure = true;
+  autarkmode = false;
+  stats.clauses.gcautark += stats.clauses.gc - og;
+  stats.clauses.gcautark -= stats.clauses.gcpure - op;
+  report (2, 'a');
+#ifdef CHECKWITHPICOSAT
+  if (opts.check) picosatcheck_consistent ();
 #endif
 }
 
@@ -2915,7 +3372,7 @@ void Solver::decompose () {
 	  LOG ("learned clause " << lit); 
 	  unit (lit); 
 	  stats.sccs.fixed++;
-	  flush ();
+	  bcp ();
 	}
       }
       if (conflict) break;
@@ -2971,7 +3428,7 @@ void Solver::decompose () {
   assert (conflict || dfsi <= 2 * maxvar);
   work.release (mem);
   mem.deallocate (sccs, bytes);
-  flush ();
+  bcp ();
 #ifndef NDEBUG
   checkvarstats ();
 #endif
@@ -3050,9 +3507,12 @@ void Solver::gc () {
 #ifndef NLOGPRECO
   size_t old = stats.collected;
 #endif
+  int round = 0;
   report (2, 'g');
   undo (0);
   disconnect ();
+RESTART:
+  LOG ("gc round " << round);
   initfwds ();
   initfwsigs ();
   gc (binary, "binary");
@@ -3065,6 +3525,7 @@ void Solver::gc () {
   }
   delfwds ();
   delfwsigs ();
+  if (needtoflush ()) { if (!bcp ()) return; round++; goto RESTART; }
   connect (binary);
   connect (original);
   for (int glue = 0; glue <= opts.glue; glue++)
@@ -3076,9 +3537,12 @@ void Solver::gc () {
   LOG ("collected " << bytes << " bytes");
   dbgprint ();
 #endif
-  flush ();
-  stats.gcs++;
+  bcp ();
   report (2, 'c');
+  stats.gcs++;
+#ifdef CHECKWITHPICOSAT
+  if (opts.check >= 2) picosatcheck_consistent ();
+#endif
 }
 
 inline int Solver::recyclelimit () const {
@@ -3113,8 +3577,9 @@ void Solver::reduce () {
     }
   }
   gc ();
-  jwh ();
-  if (count >= goal/2) report (1, '/');
+  jwh (opts.rebiasorgonly);
+  if (opts.limincmode == 2) enlarge ();
+  else if (count >= goal/2) report (1, '/');
   else report (1, '='), enlarge ();
 }
 
@@ -3141,25 +3606,13 @@ inline void Solver::checkeliminated () {
 }
 
 void Solver::probe () {
+  if (!maxvar) return;
   stats.sw2simp ();
   assert (!conflict);
   assert (queue2 == trail);
   undo (0);
   stats.probe.phases++;
   measure = false;
-  for (const Rnk * r = rnks + 1; r <= rnks + maxvar; r++) {
-    Rnk * p = prb (r);
-    int lit = 2 * (r - rnks);
-    int old_heat = p->heat;
-    int new_heat = jwhs[lit] + jwhs[lit^1];
-    if (new_heat < 0) new_heat = INT_MAX;
-    p->heat = new_heat;
-    if (schedule.probe.contains (p)) {
-      if (new_heat > old_heat) schedule.probe.up (p);
-      else if (new_heat < old_heat) schedule.probe.down (p);
-    }
-  }
-  int repcounter = 111;
   long long bound;
   if (opts.rtc == 2 || opts.probertc == 2 ||
       ((opts.rtc == 1 || opts.probertc == 1) && !stats.probe.rounds))
@@ -3169,43 +3622,35 @@ void Solver::probe () {
     for (int i = stats.probe.phases; i <= opts.probeboost; i++)
       bound += opts.probeint;
   }
-  int last = -1, filled = 0;
-  if (!schedule.probe) {
+  int last = -1, first = 0, filled = 0, pos, delta;
 FILL:
-    filled++;
-    for (int idx = 1; idx <= maxvar; idx++) {
-      Var & v = vars[idx];
-      if (v.type != FREE && v.type != EQUIV) continue;
-      int lit = 2 * idx;
-      assert (!vals[lit]);
-      if (repr[lit]) continue;
-#if 0
-      // TODO replace && by '==' for incremental scc computation
-      if (!occs[lit].bins == !occs[lit^1].bins) continue;
-#else
-      if (!occs[lit].bins && !occs[lit^1].bins) continue;
-#endif
-      Rnk * p = prbs + idx;
-      schedule.probe.push (mem, p);
-    }
-  }
+  filled++;
+  assert (maxvar);
+  pos = rng.next  () % maxvar;
+  delta = rng.next () % maxvar;
+  if (!delta) delta++;
+  while (gcd (delta, maxvar) != 1) 
+    if (++delta == maxvar) delta = 1;
+  LOG ("probing starting position " << pos << " and delta " << delta);
   report (2, 'p');
+  Progress progress (this, 'p');
   while (stats.props.simp < bound && !conflict) {
-    if (!--repcounter) {
-      if (terminal) report (2, 'p');
-      repcounter = 111;
-    }
     assert (!level);
-    if (!schedule.probe) {
+    progress.tick ();
+    int idx = pos + 1;
+    assert (1 <= idx && idx <= maxvar);
+    if (idx == first) {
       stats.probe.rounds++;
       if (last == filled) goto FILL;
       break;
     }
-    Rnk * p = schedule.probe.pop ();
-    int idx = p - prbs;
+    if (!first) first = idx;
+    pos += delta;
+    if (pos >= maxvar) pos -= maxvar;
     Var & v = vars[idx];
     if (v.type != FREE && v.type != EQUIV) continue;
     int lit = 2*idx;
+    if (!occs[lit].bins || !occs[lit+1].bins) continue;
     assert (!vals[lit]);
     if (repr[lit]) continue;
     assert (!level);
@@ -3222,18 +3667,20 @@ FILL:
     stats.probe.variables++;
     if (!bcp ()) { undo (0); goto FAILEDLIT; }
     {
-      int * q = saved.begin (), * eos = saved.end ();
+      int * q = saved.begin (), * m = q, * eos = saved.end ();
       for (const int * p = q; p < eos; p++) {
 	int other = *p;
 	if (other == (lit^1)) continue;
-	if (vals[other] < 0) merge (lit, other^1, stats.probe.merged);
-	if (vals[other] <= 0) continue;
-	*q++ = other;
+	if (vals[other] < 0) { *q++ = other^1; continue; }
+	if (!vals[other]) continue;
+	*q++ = *m;
+	*m++ = other;
       }
       undo (0);
-      if (q == saved.begin ()) continue;
-      saved.shrink (q);
-      for (const int * p = saved.begin (); p < q; p++) {
+      if (m == saved.begin ()) continue;
+      for (const int * p = m; p < q; p++)
+	 merge (lit, *p, stats.probe.merged);
+      for (const int * p = saved.begin (); p < m; p++) {
 	stats.probe.lifted++;
 	last = filled;
 	int other = *p;
@@ -3249,7 +3696,7 @@ FAILEDLIT:
     LOG ("learned clause " << (1^lit));
     unit (1^lit);
 BCPANDINCBOUND:
-    flush ();
+    bcp ();
     if (bound != LLONG_MAX)
       bound += opts.probereward + (stats.props.simp - old);
   }
@@ -3524,14 +3971,14 @@ bool Solver::itegate (int lit) {
   return true;
 }
 
-bool Solver::resolve (Cls * c, int pivot, Cls * d, bool tryonly) {
+bool Solver::resolve (Cls * c, int pivot, Cls * d, int tryonly) {
   if (tryonly) resotfs = reslimhit = false;
   assert (tryonly || (c->dirty && d->dirty));
   assert (tryonly != (vars[pivot/2].type == ELIM));
   assert (!vals[pivot] && !repr[pivot]);
   if (!tryonly && gate && c->gate == d->gate) return false;
   if (elimode) stats.elim.resolutions++;
-  else { assert (blkmode); stats.blkd.resolutions++; }
+  else { assert (blkmode); stats.blkd.res++; }
   int other, notpivot = (1^pivot), clits = 0, dlits = 0;
   bool found = false, res = true;
   const int * p;
@@ -3571,7 +4018,7 @@ bool Solver::resolve (Cls * c, int pivot, Cls * d, bool tryonly) {
     } else if (v != u) { res = false; goto DONE; }
   }
   assert (found);
-  if (opts.otfs && tryonly) {
+  if (tryonly == 1 && opts.otfs) {
 #ifndef NLOGPRECO
     bool logresolvent = false;
 #endif
@@ -3615,12 +4062,12 @@ DONE:
     assert (u->mark);
     u->mark = 0;
   }
-  if (res) {
+  if (tryonly <= 1 && res) {
     if (!lits) {
       LOG ("conflict in resolving clauses");
       conflict = &empty;
       res = false;
-    } else if (lits == 1) {
+    } else if (tryonly <= 1 && lits == 1) {
       LOG ("learned clause " << lits[0]);
       unit (lits[0]);
       res = false;
@@ -3635,16 +4082,6 @@ DONE:
   }
   lits.shrink ();
   return res;
-}
-
-inline void Solver::checkgate () {
-#ifndef NDEBUG
-  for (int i = 0; i < posgate; i++) assert (gate[i]->contains (gatepivot));
-  for (int i = posgate; i < gate; i++) assert (gate[i]->contains (1^gatepivot));
-  for (int i = 0; i < posgate; i++)
-    for (int j = posgate; j < gate; j++)
-      assert (!resolve (gate[i], gatepivot, gate[j], true));
-#endif
 }
 
 inline void Solver::block (Cls * c, int lit) {
@@ -3709,7 +4146,7 @@ RESTART:
 	d = orgs[piv^1][j];
 	if (d->gate) continue;
 	if (resolve (c, piv, d, true)) gain--, found++;
-	if (needtoflush ()) { if (!flush ()) return false; goto RESTART; }
+	if (needtoflush ()) { if (!bcp ()) return false; goto RESTART; }
 	if (val (piv)) return false;
 	if (resotfs) goto RESTART;
 	if (reslimhit) gain = INT_MIN, found++;
@@ -3723,7 +4160,7 @@ RESTART:
 	d = orgs[piv][j];
 	if (d->gate) continue;
 	if (resolve (d, piv, c, true)) gain--, found++;
-	if (needtoflush ()) { if (!flush ()) return false; goto RESTART; }
+	if (needtoflush ()) { if (!bcp ()) return false; goto RESTART; }
 	if (val (piv)) return false;
 	if (resotfs) goto RESTART;
 	if (reslimhit) gain = INT_MIN, found++;
@@ -3737,7 +4174,7 @@ RESTART:
       for (j = 0; !conflict && gain >= l && j < orgs[lit^1]; j++) {
 	d = orgs[lit^1][j];
 	if (resolve (c, lit, d, true)) gain--, found++;
-	if (needtoflush ()) { if (!flush ()) return false; goto RESTART; }
+	if (needtoflush ()) { if (!bcp ()) return false; goto RESTART; }
 	if (val (lit)) return false;
 	if (resotfs) goto RESTART;
 	if (reslimhit) gain = INT_MIN, found++;
@@ -3746,6 +4183,7 @@ RESTART:
 BLKD:
 	block (c, lit);
 	stats.blkd.impl++;
+	stats.blkd.all++;
 	goto RESTART;
       }
     }
@@ -3792,7 +4230,7 @@ ASYMMAGAIN:
 	  limit.props.asym += opts.elimasymreward;
 	  if (val (lit)) goto DONE;
 	  if (needtoflush ()) { 
-	    if (!flush ()) goto DONE; 
+	    if (!bcp ()) goto DONE; 
 	    if (val (lit)) goto DONE;
 	    goto ASYMMAGAIN;
 	  }
@@ -3824,11 +4262,6 @@ void Solver::elim (int idx) {
   assert (vars[idx].type == FREE);
   assert (!vals[lit]);
   assert (!repr[lit]);
-#if 0
-#ifndef NLOGPRECO
-  dbgprint ();
-#endif
-#endif
   LOG ("elim " << lit);
   assert (!vals[lit] && !repr[lit]);
   {
@@ -3928,7 +4361,7 @@ inline bool Solver::hasgate (int idx) {
 
 void Solver::cleans () {
   assert (!level);
-  assert (elimode || blkmode);
+  assert (elimode || blkmode || autarkmode);
   assert (orgs);
   for (int i = 0; i <= 3 + (int)opts.glue; i++) {
     Cls * p = 0;
@@ -3965,8 +4398,7 @@ void Solver::elim () {
   clrbwsigs ();
   connect (binary, true);
   connect (original, true);
-  if (!flush ()) return;
-  int repcounter = 111;
+  if (!bcp ()) return;
   long long bound;
   limit.budget.bw.sub = limit.budget.fw.sub = opts.elimint;
   limit.budget.bw.str = limit.budget.fw.str = opts.elimint;
@@ -3981,24 +4413,22 @@ void Solver::elim () {
   limit.props.asym = opts.elimasymint;
   if (schedule.elim) {
     for (int idx = 1; idx <= maxvar; idx++) {
-      int lit = 2*idx, pos = orgs[lit], neg = orgs[lit^1];
-      if (pos <= 2 || neg <= 2 || schedule.elim.contains (elms + idx))
-       	touch (lit);
+      int lit = 2*idx; // pos = orgs[lit], neg = orgs[lit^1];
+      //if (pos <= 2 || neg <= 2 || schedule.elim.contains (elms + idx))
+      touch (lit);
     }
   } else {
     for (int idx = 1; idx <= maxvar; idx++) touch (2*idx);
   }
   pure ();
   report (2, 'e');
+  Progress progress (this, 'e');
   while (!conflict && schedule.elim) {
     Rnk * e = schedule.elim.max ();
     int idx = e - elms, lit = 2*idx, pos = orgs[lit], neg = orgs[1^lit];
     if (pos > 1 && neg > 1 && (pos > 2 || neg > 2))
       if (stats.elim.resolutions > bound) break;
-    if (!--repcounter) {
-      if (terminal) report (2, 'e');
-      repcounter = 111;
-    }
+    progress.tick ();
     (void) schedule.elim.pop ();
     Var * v = vars + idx;
     if (v->type != FREE) continue;
@@ -4006,9 +4436,9 @@ void Solver::elim () {
     else if (!pos) pure (lit^1);
     else if (!neg) pure (lit);
     else {
-      if (hasgate (idx)) assert (gatestats), checkgate ();
+      if (hasgate (idx)) assert (gatestats);
       bool eliminate = trelim (idx);
-      if (needtoflush () && !flush ()) break;
+      if (needtoflush () && !bcp ()) break;
       if (!eliminate || vals[lit]) { cleangate (); continue; }
       if (gatestats) {
 	gatestats->count += 1;
@@ -4016,7 +4446,7 @@ void Solver::elim () {
 	stats.vars.subst++;
       }
       elim (idx);
-      if (needtoflush () && !flush ()) break;
+      if (needtoflush () && !bcp ()) break;
       if (bound != LLONG_MAX) bound += opts.elimreward;
     }
   }
@@ -4026,8 +4456,10 @@ void Solver::elim () {
 #ifndef NDEBUG
   for (int idx = 1; !conflict && idx <= maxvar; idx++) {
     if (vars[idx].type != FREE) continue;
+    int lit = 2*idx;
+    assert (!val (2*idx));
     if (elms[idx].pos == -1) continue;
-    int lit = 2*idx, pos = orgs[lit], neg = orgs[lit+1];
+    int pos = orgs[lit], neg = orgs[lit+1];
     assert (pos >= 2);
     assert (neg >= 2);
     assert (pos != 2 || neg != 2);
@@ -4059,13 +4491,17 @@ void Solver::elim () {
 }
 
 void Solver::zombie (Var * v) {
-  assert (elimode || blkmode);
+  assert (elimode || blkmode || autarkmode);
   assert (!level);
   assert (v->type == FREE);
   int idx = v - vars, lit = 2*idx;
   assert (!val (lit));
   assert (!orgs[lit]);
+  assert (!occs[lit].bins);
+  assert (!occs[lit].large);
   assert (!orgs[lit^1]);
+  assert (!occs[lit^1].bins);
+  assert (!occs[lit^1].large);
   assert (!repr [lit]);
   if (puremode) {
     LOG ("explicit zombie literal " << lit);
@@ -4073,6 +4509,9 @@ void Solver::zombie (Var * v) {
   } else if (blkmode) {
     LOG ("blocking zombie literal " << lit);
     stats.zombies.blkd++;
+  } else if (autarkmode) {
+    LOG ("autark zombie literal " << lit);
+    stats.zombies.autark++;
   } else {
     assert (elimode);
     LOG ("eliminating zombie literal " << lit);
@@ -4080,19 +4519,61 @@ void Solver::zombie (Var * v) {
   }
   stats.vars.zombies++;
   v->type = ZOMBIE;
+#ifndef NDEBUG
+  int old = trail;
+#endif
   assume (lit, false);
+  assert (old + 1 == trail);
   recycle (lit);
   recycle (lit^1);
-  flush ();
+  bcp ();
+  assert (old + 1 == trail);
   assert (!conflict);
 }
 
+#ifdef CHECKWITHPICOSAT
+void Solver::picosatcheck_consistent () {
+  if (picosat_inconsistent ()) return;
+  picosat_reset ();
+  picosat_init ();
+  picosatcheck.init++;
+  for (int i = 0; i <= 1; i++)
+    for (Cls * p = (i ? binary : original).tail; p; p = p->next)
+      if (!p->lnd) {
+	for (int * q = p->lits; *q; q++)
+	  picosat_add (ulit2ilit (*q));
+	picosat_add (0);
+      }
+  int res = picosat_sat (-1);
+  picosatcheck.calls++;
+  picosatcheck.blkd.all = stats.blkd.all;
+  if (res == 10) return;
+  die ("picosat says original clauses became inconsistent");
+}
+
+void Solver::picosatcheck_assume (const char * type, int lit) {
+  if (picosat_inconsistent ()) return;
+  if (picosatcheck.blkd.all < stats.blkd.all) picosatcheck_consistent ();
+  int ilit = ulit2ilit (lit);
+  picosat_assume (ilit);
+  int res = picosat_sat (-1);
+  picosatcheck.calls++;
+  if (res != 10) 
+    die ("picosat checking of %s literal %d (%d) failed", type, lit, ilit);
+  picosat_add (ilit), picosat_add (0);
+  assert (!picosat_inconsistent ());
+}
+#endif
+
 void Solver::pure (int lit) {
-  assert (elimode || blkmode);
+  assert (elimode || blkmode || autarkmode);
   assert (!level);
   assert (!val (lit));
   assert (!orgs[lit^1]);
+  assert (!occs[lit^1].bins);
+  assert (!occs[lit^1].large);
   assert (!repr [lit]);
+  assert (!needtoflush ());
   Var * v = vars + (lit/2);
   assert (v->type == FREE);
   if (puremode) {
@@ -4101,16 +4582,49 @@ void Solver::pure (int lit) {
   } else if (blkmode) {
     LOG ("blocking pure literal " << lit);
     stats.pure.blkd++;
-  } else  {
-  assert (elimode);
+  } else  if (autarkmode) {
+    LOG ("autark pure literal " << lit);
+    stats.pure.autark++;
+  } else {
+    assert (elimode);
     LOG ("eliminating pure literal " << lit);
     stats.pure.elim++;
   }
   stats.vars.pure++;
+  stats.clauses.gcpure += orgs[lit];
   v->type = PURE;
+#ifndef NDEBUG
+  int old  = trail;
+#endif
   assume (lit, false);
-  flush ();
+  assert (old + 1 == trail);
+  bcp ();
+  assert (old + 1 == trail);
   assert (!conflict);
+#ifdef CHECKWITHPICOSAT
+  if (opts.check >= 2) picosatcheck_assume ("pure", lit);
+#endif
+}
+
+void Solver::autark (int lit) {
+  assert (autarkmode);
+  assert (!level);
+  assert (!val (lit));
+  assert (!vals[lit]);
+  Var * v = vars + (lit/2);
+  if (v->type == EQUIV) {
+    assert (stats.vars.equiv);
+    stats.vars.equiv--;
+  } else assert (v->type == FREE);
+  LOG ("autark literal " << lit);
+  stats.vars.autark++;
+  v->type = AUTARK;
+  assume (lit, false);
+  bcp ();
+  assert (!conflict);
+#ifdef CHECKWITHPICOSAT
+  if (opts.check >= 2) picosatcheck_assume ("autark", lit);
+#endif
 }
 
 void Solver::block () {
@@ -4123,14 +4637,13 @@ void Solver::block () {
   initorgs ();
   connect (binary, true);
   connect (original, true);
-  if (!flush ()) return;
-  int repcounter = 111;
+  if (!bcp ()) return;
   long long bound;
   if (opts.rtc == 2 || opts.blockrtc == 2 ||
       ((opts.rtc == 1 || opts.blockrtc == 1) && !stats.blkd.rounds)) {
     bound = LLONG_MAX;
   } else {
-    bound = stats.blkd.resolutions + opts.blockint;
+    bound = stats.blkd.res + opts.blockint;
     for (int i = stats.blkd.phases; i <= opts.blockboost; i++)
       bound += opts.blockint;
   }
@@ -4142,13 +4655,11 @@ void Solver::block () {
   }
   pure ();
   report (2, 'k');
-  while (!conflict && schedule.block && stats.blkd.resolutions <= bound) {
+  Progress progress (this, 'k');
+  while (!conflict && schedule.block && stats.blkd.res <= bound) {
     Rnk * b = schedule.block.pop ();
     int lit = b - blks;
-    if (!repcounter--) {
-      if (terminal) report (2, 'k');
-      repcounter = 111;
-    }
+    progress.tick ();
 RESTART:
     Var * v = vars + (lit/2);
     if (v->type != FREE) continue;
@@ -4165,7 +4676,7 @@ RESTART:
 	bool blocked = true;
 	for (int j = 0; !conflict && blocked && j < orgs[lit^1]; j++) {
 	  blocked = !resolve (c, lit, orgs[lit^1][j], true);
-	  if (needtoflush ()) { if (!flush ()) goto DONE; goto RESTART; }
+	  if (needtoflush ()) { if (!bcp ()) goto DONE; goto RESTART; }
 	  if (blocked && resotfs) goto RESTART;
 	}
 	if (!blocked) continue;
@@ -4173,6 +4684,7 @@ RESTART:
 	if (val (lit)) break;
 	block (c, lit);
 	stats.blkd.expl++;
+	stats.blkd.all++;
 	if (bound != LLONG_MAX) bound += opts.blockreward;
       }
     }
@@ -4201,7 +4713,7 @@ void Solver::pure () {
   assert (orgs);
   assert (blkmode || elimode);
   assert (!puremode);
-  if (!flush ()) return;
+  if (!bcp ()) return;
   puremode = true;
   assert (!plits);
   report (2, 'u');
@@ -4226,13 +4738,14 @@ void Solver::pure () {
   report (2, 'u');
 }
 
-void Solver::jwh () {
+void Solver::jwh (bool orgonly) {
   memset (jwhs, 0, 2 * (maxvar + 1) * sizeof *jwhs);
-  for (Cls * p = original.head; p; p = p->prev) jwh (p);
-  for (Cls * p = binary.head; p; p = p->prev) jwh (p);
-  for (Cls * p = fresh.head; p; p = p->prev) jwh (p);
+  for (Cls * p = original.head; p; p = p->prev) jwh (p, orgonly);
+  for (Cls * p = binary.head; p; p = p->prev) jwh (p, orgonly);
+  if (orgonly) return;
+  for (Cls * p = fresh.head; p; p = p->prev) jwh (p, orgonly);
   for (int glue = 0; glue <= opts.glue; glue++)
-    for (Cls * p = learned[glue].head; p; p = p->prev) jwh (p);
+    for (Cls * p = learned[glue].head; p; p = p->prev) jwh (p, orgonly);
 }
 
 void Solver::initfresh () {
@@ -4255,15 +4768,18 @@ void Solver::initreduce () {
 
 void Solver::enlarge () {
   stats.enlarged++;
-  if (opts.limincmode) {
+  if (opts.limincmode == 1) {
     limit.reduce.learned = 
       ((100 + opts.limincpercent) * limit.reduce.learned + 99) / 100;
     limit.enlarge.inc = ((100 + opts.enlinc) * limit.enlarge.inc + 99) / 100;
     limit.enlarge.conflicts = stats.conflicts + limit.enlarge.inc;
-  } else {
+  } else if (opts.limincmode == 0) {
     limit.enlarge.inc += opts.liminconst1;
     limit.enlarge.conflicts += limit.enlarge.inc;
     limit.reduce.learned += opts.liminconst2;
+  } else {
+    assert (opts.limincmode == 2);
+    limit.reduce.learned += 2000;
   }
   if (limit.reduce.learned > opts.maxlimit) {
     limit.reduce.learned = opts.maxlimit;
@@ -4305,11 +4821,15 @@ void Solver::simplify () {
   stats.sw2simp ();
   int old = stats.clauses.orig, inc, rv;
   undo (0);
+  assert (!simpmode);
+  simpmode = true;
 RESTART:
   simplified = false;
   decompose ();
   if (conflict) goto DONE;
   gc ();
+  if (conflict) goto DONE;
+  autark ();
   if (conflict) goto DONE;
   block ();
   if (conflict) goto DONE;
@@ -4319,7 +4839,6 @@ RESTART:
       ((opts.rtc == 2 || opts.simprtc == 2) ||
        ((opts.rtc == 1 || opts.simprtc == 1) && !stats.simps)))
      goto RESTART;
-  jwh ();
   limit.props.simp = stats.props.srch + simprd * clauses ();
   limit.simp = stats.vars.fixed + stats.vars.merged;
   limit.fixed.simp = stats.vars.fixed;
@@ -4327,20 +4846,26 @@ RESTART:
   inc = opts.simpinc; 
   if (rv) while (rv < 1000000) rv *= 10, inc /= 2;
   simprd *= 100 + inc; simprd += 99; simprd /= 100;
+  jwh (opts.rebiasorgonly);
   report (1, 's');
-  if (!stats.simps) initreduce ();
-  else shrink (old);
+  if (stats.simps) shrink (old);
+  else initreduce ();
 DONE:
-  if (opts.print) print ();
+  if (opts.print) print (opts.output);
   stats.simps++;
   stats.sw2srch ();
+  assert (simpmode);
+  simpmode = false;
+#ifdef CHECKWITHPICOSAT
+  if (opts.check) picosatcheck_consistent ();
+#endif
 }
 
 void Solver::flushunits () {
   assert (units);
   undo (0);
   while (units && !conflict) unit (units.pop ());
-  flush ();
+  bcp ();
 }
 
 void Solver::initrestart () {
@@ -4352,7 +4877,7 @@ void Solver::initrestart () {
 }
 
 void Solver::initbias () {
-  jwh ();
+  jwh (opts.rebiasorgonly);
   limit.rebias.conflicts = opts.rebiasint * luby (limit.rebias.lcnt = 1);
   limit.rebias.conflicts += stats.conflicts;
 }
@@ -4360,23 +4885,17 @@ void Solver::initbias () {
 void Solver::iteration () {
   assert (!level);
   assert (iterating);
-  assert (limit.fixed.iter < trail);
   stats.iter++;
-  initrestart ();
-  int old = stats.clauses.orig;
-  while (limit.fixed.iter < trail) {
-    int lit = trail[limit.fixed.iter++];
-    recycle (lit);
-  }
+  initrestart ();//TODO really?
   iterating = false;
   report (2, 'i');
-  shrink (old);
 }
 
 inline bool Solver::reducing () const {
+  if (opts.limincmode == 2) return stats.clauses.lnd >= limit.reduce.learned;
   int learned_not_locked = stats.clauses.lnd;
   learned_not_locked -= stats.clauses.lckd;
-  return 2 * learned_not_locked > 3 * limit.reduce.learned;
+  return 2 * learned_not_locked > 4 * limit.reduce.learned;
 }
 
 inline bool Solver::eliminating () const {
@@ -4406,7 +4925,8 @@ inline bool Solver::simplifying () const {
 }
 
 inline bool Solver::restarting () const {
-  return level >= 2 && limit.restart.conflicts <= stats.conflicts;
+  if (level < opts.restartminlevel) return 0;
+  return limit.restart.conflicts <= stats.conflicts;
 }
 
 inline bool Solver::rebiasing () const {
@@ -4415,13 +4935,11 @@ inline bool Solver::rebiasing () const {
 
 inline bool Solver::probing () const {
   if (!opts.probe) return false;
-  if (stats.props.srch < limit.props.probe) return false;
-  if (!level) return true;
-  if (schedule.probe) return true;
-  return limit.fixed.probe < stats.vars.fixed;
+  return (stats.props.srch > limit.props.probe);
 }
 
 inline bool Solver::enlarging () const {
+  if (opts.limincmode == 2) return false;
   if (limit.reduce.learned >= opts.maxlimit) return false;
   return stats.conflicts >= limit.enlarge.conflicts;
 }
@@ -4459,6 +4977,15 @@ void Solver::initsearch (int decision_limit) {
   initlimit (decision_limit);
   initbias ();
   initrestart ();
+#ifdef CHECKWITHPICOSAT
+  int res = picosat_sat (-1);
+  picosatcheck.calls++;
+  if (opts.verbose) {
+    printf ("c checking with picosat returns %d\n", res);
+    fflush (stdout);
+  }
+  assert ((res == 20) == picosat_inconsistent ());
+#endif
   report (1, '*');
 }
 
@@ -4466,7 +4993,7 @@ int Solver::solve (int decision_limit) {
   initsearch (decision_limit);
   int res = search ();
   report (1, res < 0 ? '0' : (res ? '1' : '?'));
-  if (!stats.simps && opts.print) print ();
+  if (!stats.simps && opts.print) print (opts.output);
   return res;
 }
 
@@ -4520,12 +5047,12 @@ void PrecoSat::die (const char * msg, ...) {
   abort ();
 }
 
-void Solver::print () {
+void Solver::print (const char * name) {
   bool close_file;
   FILE * file;
-  if (opts.output) {
-    file = fopen (opts.output, "w");
-    if (!file) die ("can not write '%s'", opts.output);
+  if (name) {
+    file = fopen (name, "w");
+    if (!file) die ("can not write '%s'", name);
     close_file = true;
   } else file = stdout, close_file = false;
 
@@ -4572,6 +5099,8 @@ void Solver::print () {
   report (1, 'w');
 }
 
+void Solver::print () { print (0); }
+
 void Cls::print (const char * prefix) const {
   fputs (prefix, stdout);
   for (const int * p = lits; *p; p++) {
@@ -4584,7 +5113,7 @@ void Cls::print (const char * prefix) const {
 void Solver::dbgprint (const char * type, Anchor<Cls>& anchor) {
   size_t len = strlen (type) + strlen (prfx) + 80;
   char * str = (char*) mem.allocate (len);
-  sprintf (str, "%sPRINT %s clause ", prfx, type);
+  sprintf (str, "%sLOG PRINT %s clause ", prfx, type);
   for (Cls * p = anchor.tail; p; p = p->next) p->print (str);
   mem.deallocate (str, len);
 }

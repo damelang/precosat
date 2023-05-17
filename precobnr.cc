@@ -1,5 +1,5 @@
 /***************************************************************************
-Copyright (c) 2009, Armin Biere, Johannes Kepler University.
+Copyright (c) 2009 - 2010, Armin Biere, Johannes Kepler University.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to
@@ -32,7 +32,7 @@ const char * precosat_version () {
 
 void precosat_banner () {
   printf ("c PrecoSAT Version %s %s\n", PRECOSAT_VERSION, PRECOSAT_ID);
-  printf ("c Copyright (C) 2009, Armin Biere, JKU, Linz, Austria."
+  printf ("c Copyright (C) 2009 - 2010, Armin Biere, JKU, Linz, Austria."
           "  All rights reserved.\n");
   printf ("c Released on %s\n", PRECOSAT_RELEASED);
   printf ("c Compiled on %s\n", PRECOSAT_COMPILED);

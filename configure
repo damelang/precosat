@@ -1,12 +1,14 @@
 #!/bin/sh
 
 cpt=no # enforces competition settings if set to yes
+memdbg=no
+picosat=no
 
 rm -f makefile
 
 if [ ! x"$cpt" = xyes ]
 then
-cov=no;dbg=no;log=no;m32=no;opt=no;chk=no;stc=no;sts=no
+cov=no;dbg=no;log=no;chk=no;stc=no;sts=no;m32=no
 while [ $# -gt 0 ]
 do
   case $1 in
@@ -14,33 +16,39 @@ do
 echo "usage: configure [-h|-g|-O|-l|-c|-m32|-static|--check|--stats]"
 echo "-h                   print this command line option summary"
 echo "-g                   compiling with debugging information"
-echo "-O                   heavy optimizations through compiler"
 echo "-l                   enable logging"
 echo "-c                   enable coverage"
 echo "-m32                 enforce 32 bit binary even on 64 bit machine"
 echo "-s|-static|--static  static compilation"
 echo "--check              enable expensive assertion checking"
 echo "--stats              enable slightly more expensive statistics"
+echo "--mem-debug          print (de)allocations for memory debugging"
+echo "--competition        enforce competition settings"
 exit 0
 ;;
-    -g) dbg=yes;opt=no;sts=yes;;
-    -O) dbg=no;opt=yes;sts=no;;
+    -g) dbg=yes;sts=yes;;
+    -O) dbg=no;sts=no;;
     -l) log=yes;;
     -c) cov=yes;;
     -m32) m32=yes;;
     -s|-static|--static) stc=yes;;
     --check) chk=yes;;
     --stats) sts=yes;;
+    --mem-debug) memdbg=yes;;
+    --picosat) picosat=yes;;
+    --competition) cpt=yes;;
     *) echo "*** configure: invalid option" 1>&2; exit 1;;
   esac
   shift
 done
 else
-cov=no;dbg=no;log=no;m32=yes;opt=yes;chk=no;stc=yes;sts=no
+cov=no;dbg=no;log=no;m32=yes;chk=no;stc=yes;sts=no
 fi
 
+LIBS=""
+DEPS=""
+
 [ $cov = yes ] && dbg=yes
-[ $chk = yes ] && opt=no
 [ x"$CXX" = x ] && CXX=g++
 [ $dbg = yes ] && CXXFLAGS="-g"
 [ $dbg = no ] && CXXFLAGS="-O3"
@@ -50,10 +58,35 @@ CXXFLAGS="$CXXFLAGS -Wall -Wextra"
 [ $dbg = no -a $chk = no ] && CXXFLAGS="$CXXFLAGS -DNDEBUG"
 [ $log = no ] && CXXFLAGS="$CXXFLAGS -DNLOGPRECO"
 [ $sts = no ] && CXXFLAGS="$CXXFLAGS -DNSTATSPRECO"
-[ $opt = yes ] && CXXFLAGS="$CXXFLAGS -finline-limit=10000000"
-[ $opt = yes ] && CXXFLAGS="$CXXFLAGS -fomit-frame-pointer"
-[ $opt = yes ] && CXXFLAGS="$CXXFLAGS -fno-exceptions"
-[ $cov = yes ] && CXXFLAGS="$CXXFLAGS -fprofile-arcs -ftest-coverage"
+[ $memdbg = yes ] && CXXFLAGS="$CXXFLAGS -DMEMDBGPRECO"
+if [ $picosat = yes ]
+then
+  LIBS="-L../picosat -lpicosat"
+  DEPS="../picosat/libpicosat.a"
+  CXXFLAGS="$CXXFLAGS -DCHECKWITHPICOSAT"
+fi
+if [ $cpt = yes ]
+then
+  CXXFLAGS="$CXXFLAGS -march=core2"
+  TARGETS="feedback"
+  CXX=/usr/bin/g++
+  for CNF in /data/cnf/sc2009/applications/simon-s03-fifo8-300.cnf \
+	     /data/cnf/cmu/longmult12.dimacs \
+	     log/prime65537.in \
+	     none
+  do
+    [ -f $CNF ] && break;
+  done
+else
+  TARGETS="targets"
+fi
 echo "$CXX $CXXFLAGS"
 
-sed -e "s,@CXX@,$CXX," -e "s,@CXXFLAGS@,$CXXFLAGS,g" makefile.in > makefile
+sed \
+   -e "s,@CXX@,$CXX," \
+   -e "s,@CXXFLAGS@,$CXXFLAGS,g" \
+   -e "s,@LIBS@,$LIBS,g" \
+   -e "s,@TARGETS@,$TARGETS,g" \
+   -e "s,@DEPS@,$DEPS,g" \
+   -e "s,@CNF@,$CNF,g" \
+   makefile.in > makefile

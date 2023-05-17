@@ -35,7 +35,7 @@ sed \
 echo "#define PRECOSAT_OS \"`uname -srmn`\""
 echo "#define PRECOSAT_COMPILED \"`date`\""
 cat<<EOF
-#define PRECOSAT_RELEASED "Mon Feb  8 09:21:54 CET 2010"
-#define PRECOSAT_VERSION "465"
-#define PRECOSAT_ID "02807a34359255dd8b68e2afb28f09e860597049"
+#define PRECOSAT_RELEASED "Thu Jan 12 07:59:44 CET 2012"
+#define PRECOSAT_VERSION "576"
+#define PRECOSAT_ID "7e5e66faa15ff83953915cba4b46afe851cd5847"
 EOF

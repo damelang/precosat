@@ -1,5 +1,5 @@
 /***************************************************************************
-Copyright (c) 2009, Armin Biere, Johannes Kepler University.
+Copyright (c) 2009 - 2011, Armin Biere, Johannes Kepler University.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to
@@ -29,6 +29,7 @@ IN THE SOFTWARE.
 #include <cstdarg>
 #include <cstring>
 #include <cstdio>
+#include <cstddef>
 
 namespace PrecoSat {
 
@@ -59,6 +60,9 @@ public:
     res = newfun ? newfun (emgr, bytes) : malloc (bytes);
     if (!res) die ("out of memory allocating %d MB", mb);
     *this += bytes;
+#ifdef MEMDBGPRECO
+    fprintf (stderr, "allocate %p %d %d\n", res, bytes, cur);
+#endif
     return res;
   }
   void * callocate (size_t bytes) {
@@ -69,10 +73,16 @@ public:
   void * reallocate (void * ptr, size_t old_bytes, size_t new_bytes) {
     size_t mb = new_bytes >> 20;
     *this -= old_bytes;
+#ifdef MEMDBGPRECO
+    fprintf (stderr, "deallocate %p %d %d\n", ptr, old_bytes, cur);
+#endif
     void * res  = resizefun ? resizefun (emgr, ptr, old_bytes, new_bytes) :
                               realloc (ptr, new_bytes);
     if (!res) die ("out of memory reallocating %ld MB", (long) mb);
     *this += new_bytes;
+#ifdef MEMDBGPRECO
+    fprintf (stderr, "allocate %p %d %d\n", res, new_bytes, cur);
+#endif
     return res;
   }
   void * recallocate (void * ptr, size_t o, size_t n) {
@@ -84,6 +94,9 @@ public:
     *this -= bytes;
     if (deletefun) deletefun (emgr, ptr, bytes); 
     else free (ptr);
+#ifdef MEMDBGPRECO
+    fprintf (stderr, "deallocate %p %d %d\n", ptr, bytes, cur);
+#endif
   }
 };
 
@@ -130,6 +143,16 @@ public:
       if (next == d) return;
       prev = next;
     }
+  }
+  void trymove (const T & d) {
+    T * p = t;
+    for (;;) {
+      if (p == a) return;
+      if (*--p == d) break;
+    }
+    assert (p < t);
+    while (++p < t) p[-1] = p[0];
+    t--;
   }
 };
 
@@ -317,9 +340,10 @@ enum Vrt {
   FREE = 0,
   ZOMBIE = 1,
   PURE = 2,
-  ELIM = 3,
-  EQUIV = 4,
-  FIXED = 5,
+  AUTARK = 3,
+  ELIM = 4,
+  EQUIV = 5,
+  FIXED = 6,
 };
 
 typedef enum Vrt Vrt;
@@ -338,8 +362,8 @@ struct Cls {
   static const unsigned LDMAXGLUE = 4, MAXGLUE = (1<<LDMAXGLUE)-1;
   bool locked:1,lnd:1,garbage:1;
   bool binary:1,trash:1,dirty:1;
-  bool gate:1,str:1,fresh:1;
-  static const int LDMAXSZ = 32 - 10 - LDMAXGLUE, MAXSZ = (1<<LDMAXSZ)-1;
+  bool gate:1,str:1,fresh:1,freed:1;
+  static const int LDMAXSZ = 32 - 9 - LDMAXGLUE, MAXSZ = (1<<LDMAXSZ)-1;
   bool glued:1;
   unsigned glue:LDMAXGLUE, size:LDMAXSZ, sig;
   Cls * prev, * next;
@@ -362,27 +386,29 @@ struct Frame {
 struct GateStats { int count, len; };
 
 struct Stats {
-  struct { int fixed, equiv, elim, subst, zombies, pure, merged; } vars;
-  struct { int orig, bin, lnd, irr, lckd, gc; } clauses;
+  struct { int fixed,equiv,elim,subst,zombies,pure,autark,merged; } vars;
+  struct { int orig,bin,lnd,irr,lckd,gc,gcpure,gcautark,oadd; } clauses;
+  struct { int count, size, dh[6]; } autarks;
   struct { long long added; int bssrs, ssrs; } lits;
   struct { long long deleted, strong, inverse; int depth; } mins;
   int conflicts, decisions, random, enlarged, shrunken, rescored, iter;
+  struct { int track, jump; long long dist, cuts; } back;
   struct { int count, skipped, maxdelta; } restart;
   struct { int count, level1, probing; } doms;
   struct { GateStats nots, ites, ands, xors; } subst;
   struct { int fw, bw, dyn, org, doms, red; } subs;
-  struct { long long resolutions; int impl, expl, phases, rounds; } blkd;
+  struct { long long res; int all, impl, expl, phases, rounds; } blkd;
   struct { int fw, bw, dyn, org, asym; } str;
   struct { struct { int bin, trn, large; } dyn, stat; } otfs;
-  struct { long long slimmed, sum, count; } glue;
+  struct { struct { long long sum, count; } slimmed, orig; } glue;
   struct { int count, maxdelta; } rebias;
   struct { int variables, phases, rounds, failed, lifted, merged; } probe;
   struct { int nontriv, fixed, merged; } sccs;
   struct { int forced, assumed, flipped; } extend;
   struct { long long resolutions; int phases, rounds; } elim;
   struct { struct { struct { long long srch,hits; } l1,l2;} fw,bw;} sigs;
-  struct { int expl, elim, blkd; } pure;
-  struct { int expl, elim, blkd; } zombies;
+  struct { int expl, elim, blkd, autark; } pure;
+  struct { int expl, elim, blkd, autark; } zombies;
   struct { long long srch, simp; } props;
   long long visits, ternaryvisits, blocked, sumheight, collected;
   int simps, reductions, gcs, reports, maxdepth, printed;
@@ -418,15 +444,18 @@ struct Opt {
 };
 
 struct Opts {
-  int quiet, verbose, print;
+  int quiet, verbose, print, terminal;
   int dominate, maxdoms;
   int plain, rtc;
   int merge;
   int otfs;
   int redsub;
+  int autark,autarkdhs;
+  int phase;
   int block,blockimpl,blockprd,blockint,blockrtc,blockclim,blockotfs;
   int blockreward,blockboost;
   int simprd, simpinc, simprtc;
+  int cutrail;
   int probe,probeprd,probeint,probertc,probereward,probeboost;
   int decompose;
   int inverse,inveager,mtfall,mtfrev;
@@ -435,10 +464,10 @@ struct Opts {
   int elim,elimgain,elimin,elimprd,elimint,elimrtc,elimclim;
   int elimreward,elimboost,elimasym,elimasymint,elimasymreward;
   int subst, ands, xors, ites;
-  int fwmaxlen,bwmaxlen,reslim,blkmaxlen;
+  int fw,dynbw,fwmaxlen,bwmaxlen,reslim,blkmaxlen;
   int heatinc;
-  int restart, restartint, luby, restartinner, restartouter;
-  int rebias, rebiasint;
+  int restart, restartint, luby, restartinner, restartouter, restartminlevel;
+  int rebias,rebiasint,rebiasorgonly;
   int minlimit, maxlimit;
   int dynred;
   int liminitmode;//0=constant,1=relative
@@ -473,6 +502,7 @@ public:
   RNG () : state (0) { }
   unsigned next ();
   bool oneoutof (unsigned);
+  bool choose ();
   void init (unsigned seed) { state = seed; }
 };
 
@@ -502,21 +532,21 @@ class Solver {
   Fwds * fwds;
   unsigned * bwsigs, * fwsigs;
   Rnk * rnks, * prbs, * elms, * blks;
-  struct { Heap<Rnk,Hotter> decide, probe, elim, block; } schedule;
+  struct { Heap<Rnk,Hotter> decide, elim, block; } schedule;
   int maxvar, size, queue, queue2, level, jlevel, uip, open, resolved;
-  Stack<int> trail, lits, units, levels, saved, elits, plits, check;
+  Stack<int> trail, lits, units, levels, saved, elits, plits, flits, check;
   Stack<Frame> frames;
   Stack<Var *> seen;
-  Stack<Cls *> trash, gate, strnd;
+  Stack<Cls *> trash, gate, strnd, fclss;
   Cls * conflict, empty, dummy;
   Anchor<Cls> original, binary, fresh, learned[Cls::MAXGLUE+1];
   int hinc, simprd, agility, spread, posgate, gatepivot, gatelen, typecount;
   int elimvar, blklit;
   char lastype;
   GateStats * gatestats;
-  bool terminal, iterating, blkmode, extending;
+  bool terminal, terminitialized, iterating, blkmode, extending;
   bool resotfs, reslimhit, simplified, needrescore;
-  bool measure, elimode, bkdmode, puremode, asymode;
+  bool measure,simpmode,elimode,bkdmode,puremode,asymode,autarkmode;
   RNG rng;
   Stats stats;
   Limit limit;
@@ -525,14 +555,22 @@ class Solver {
   Opts opts;
   Mem mem;
 
+#ifdef CHECKWITHPICOSAT
+  struct { 
+    struct { int all; } blkd; 
+    int calls, init;
+  } picosatcheck;
+  void picosatcheck_assume (const char *, int);
+  void picosatcheck_consistent ();
+#endif
+
   Rnk * prb (const Rnk *);
   Rnk * rnk (const Var *);
   Var * var (const Rnk *);
 
   int & iirf (Var *, int);
 
-  Val fixed (int lit) const;
-
+  bool hasterm ();
   void initerm ();
   void initfwds ();
   void initfwsigs ();
@@ -542,6 +580,7 @@ class Solver {
   void clrbwsigs ();
   void rszbwsigs (int newsize);
   void rsziirfs (int newsize);
+  void connectorgs ();
   void delorgs ();
   void delfwds ();
   void delfwsigs ();
@@ -616,6 +655,7 @@ class Solver {
   bool inverse (int lit);
   bool minimize (Var *, int depth);
   int luby (int);
+  friend class Progress;
   void report (int v, char ch);
   void prop2 (int lit);
   void propl (int lit);
@@ -642,10 +682,10 @@ class Solver {
   void shrink (int);
   void enlarge ();
   void checkvarstats ();
+  void freecls (Cls *);
+  void autark ();
   void decompose ();
-  bool resolve (int l, int pivot, int k, bool tryonly);
-  bool resolve (int l, int pivot, Cls *, bool tryonly);
-  bool resolve (Cls *, int pivot, Cls *, bool tryonly);
+  bool resolve (Cls *, int pivot, Cls *, int tryonly);
   bool andgate (int lit);
   Cls * find (int a, int b, int c);
   int itegate (int lit, int cond, int t);
@@ -660,6 +700,7 @@ class Solver {
   void block ();
   void zombie (Var*);
   void pure (int lit);
+  void autark (int lit);
   void pure ();
   void cleantrash ();
   void cleangate ();
@@ -671,14 +712,16 @@ class Solver {
   void strcls (Cls *c);
   void gc (Anchor<Cls> &, const char*);
   void gc ();
-  void jwh (Cls *);
-  void jwh ();
+  void jwh (Cls *, bool orgonly);
+  void jwh (bool orgonly);
   void reduce ();
   void simplify ();
   void iteration ();
   void restart ();
   void rebias ();
+  void unassign (int lit, bool save = false);
   void undo (int newlevel, bool save = false);
+  void cutrail (int);
   void pull (int lit);
   bool analyze ();
 
@@ -691,14 +734,13 @@ class Solver {
   bool satisfied (const Cls*);
   bool satisfied (Anchor<Cls> &);
 
+  void print (const char * name);
   void print ();
 
   void dbgprint (const char *, Cls *);
   void dbgprint (const char *, Anchor<Cls> &);
   void dbgprint ();
   void dbgprintgate ();
-
-  void checkgate ();
 
 public:
 
@@ -719,12 +761,15 @@ public:
   int next () { int res = maxvar + 1; resize (res); return res; }
   int solve (int decision_limit = INT_MAX);
   int val (int l) { return vals[find (l)]; }
+  Val fixed (int lit) const;
   double seconds () { return stats.seconds (); }
   bool satisfied ();
   void prstats ();
   void propts ();
   void reset ();
   int getMaxVar () const { return maxvar; }
+  int getAddedOrigClauses () const { return stats.clauses.oadd; }
+  operator bool () const { return initialized; }
 };
 
 };
