@@ -161,8 +161,9 @@ int main (int argc, char ** argv) {
     }
     name = argv[i];
     if (hasgzsuffix (name)) {
-      char * cmd = (char*) malloc (strlen(name) + 100);
-      sprintf (cmd, "gunzip -c %s 2>/dev/null", name);
+      size_t len = strlen(name) + 100;
+      char * cmd = (char*) malloc (len);
+      snprintf (cmd, len, "gunzip -c %s 2>/dev/null", name);
       if ((file = popen (cmd, "r")))
 	pclosefile = true;
       free (cmd);

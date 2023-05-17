@@ -575,7 +575,7 @@ void Opts::printoptions (FILE * file, const char * prfx) const {
   const Opt * o = opts.begin ();
   while (o < opts.end ()) {
     char line[80];
-    sprintf (line, " --%s=%d", o->name, *o->valptr);
+    snprintf (line, sizeof (line), " --%s=%d", o->name, *o->valptr);
     int len = strlen (line); assert (len < 80);
     if (len + pos >= 77 - lenprfx) {
       fprintf (file, "\n%s", prfx);
@@ -2506,7 +2506,7 @@ void Solver::bump (Cls * c) {
     if (vals[lit] > 0) break;
   if (lit) {
     char buffer[100];
-    sprintf (buffer, "LOG bump %d forcing clause ", lit);
+    snprintf (buffer, sizeof (buffer), "LOG bump %d forcing clause ", lit);
     dbgprint (buffer, c);
   } else dbgprint ("LOG bump conflicting clause ", c);
 #endif
@@ -3520,7 +3520,7 @@ RESTART:
   gc (fresh, "fresh");
   for (int glue = 0; glue <= opts.glue; glue++) {
     char buffer[80];
-    sprintf (buffer, "learned[%u]", glue);
+    snprintf (buffer, sizeof (buffer), "learned[%u]", glue);
     gc (learned[glue], buffer);
   }
   delfwds ();
@@ -5113,7 +5113,7 @@ void Cls::print (const char * prefix) const {
 void Solver::dbgprint (const char * type, Anchor<Cls>& anchor) {
   size_t len = strlen (type) + strlen (prfx) + 80;
   char * str = (char*) mem.allocate (len);
-  sprintf (str, "%sLOG PRINT %s clause ", prfx, type);
+  snprintf (str, len, "%sLOG PRINT %s clause ", prfx, type);
   for (Cls * p = anchor.tail; p; p = p->next) p->print (str);
   mem.deallocate (str, len);
 }
@@ -5121,7 +5121,7 @@ void Solver::dbgprint (const char * type, Anchor<Cls>& anchor) {
 void Solver::dbgprint (const char * type, Cls * cls) {
   size_t len = strlen (type) + strlen (prfx) + 1;
   char * str = (char*) mem.allocate (len);
-  sprintf (str, "%s%s", prfx, type);
+  snprintf (str, len, "%s%s", prfx, type);
   cls->print (str);
   mem.deallocate (str, len);
 }
@@ -5131,7 +5131,7 @@ void Solver::dbgprint () {
   dbgprint ("original", original);
   for (int glue = 0; glue <= opts.glue; glue++) {
     char buffer[80];
-    sprintf (buffer, "learned[%u]", glue);
+    snprintf (buffer, sizeof (buffer), "learned[%u]", glue);
     dbgprint (buffer, learned[glue]);
   }
   dbgprint ("fresh", fresh);
