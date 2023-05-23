@@ -904,7 +904,7 @@ void Solver::reset () {
   lits.release (mem);
   seen.release (mem);
   assert (!mem);
-  memset (this, 0, sizeof *this);
+  *this = Solver ();
 #ifdef CHECKWITHPICOSAT
   picosat_reset ();
 #endif
@@ -4966,7 +4966,8 @@ int Solver::search () {
 }
 
 void Solver::initlimit (int decision_limit) {
-  memset (&limit, 0, sizeof limit);
+  limit = Limit ();
+  limit.budget.fw.sub = limit.budget.bw.sub = limit.budget.bw.str = limit.budget.fw.str = 0;
   limit.decisions = decision_limit;
   simprd = opts.simprd;
   rng.init (opts.seed);
